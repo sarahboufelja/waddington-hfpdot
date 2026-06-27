@@ -1,4 +1,3 @@
-import numpy as np
 import logging
 import os
 
@@ -6,14 +5,11 @@ os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import jax
-from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from datetime import date
 from jax import Array
 import jax.numpy as jnp
 from jax.scipy.special import ndtri
-import jax.scipy.stats as stats
-from jax.scipy.special import logsumexp
 from jax.experimental import mesh_utils
 from typing import Tuple, Literal
 from supports import make_support, LogProbFn, ScoreFn
@@ -56,6 +52,7 @@ class MetropolisAdjustedLangevinSampler:
         warm_up_steps: int = 500,
         step_size: float = 0.1,
         num_parallel_chains: int = jax.local_device_count(),
+        seed: int = 0
     ):
         """Initializes the MetropolisAdjustedLangevinSampler transition kernel.
 
@@ -79,7 +76,8 @@ class MetropolisAdjustedLangevinSampler:
         self.num_burnin = num_burnin
         self.warm_up_steps = warm_up_steps
         self.step_size = step_size
-        self.init_key = jax.random.key(int(date.today().strftime("%Y%m%d")))
+        self.seed = seed
+        self.init_key = jax.random.key(self.seed)
         self.alpha = alpha ## smoothing factor of the exponential moving average
         self.num_samples = num_samples
         self.tot_num_samples = self.num_samples + self.num_burnin
@@ -121,7 +119,9 @@ class MetropolisAdjustedLangevinSampler:
         # * TODO: Use the entropy regularized solution of the unbalanced optimal transport problem to initialize the chains
         # in a more principled way and facilitate convergence to the target distribution.
         def _one_chain(key, index):
-            scale = 0.1 + 0.99 * index / (self.parallel_chains - 1)
+            # Spread initial scales across chains; guard the single-chain case (no spread).
+            denom = max(self.parallel_chains - 1, 1)
+            scale = 0.1 + 0.99 * index / denom
             return jax.random.truncated_normal(key,
                                                lower = 1e-6,
                                                upper = 1,
@@ -158,9 +158,10 @@ class MetropolisAdjustedLangevinSampler:
         mass_diag = jnp.var(warm_pmap_states, axis=(0, 1))
 
         # * Second stage is the main sampling stage with Robbins-Monro step size adaptation, using the estimated mass matrix.
-        # * Update the initial parameters with the final state of the warm-up stage to ensure continuity between the two stages.
-        sharded_params = (warm_carry_state[0], warm_carry_state[3])
-        sharded_params = jax.device_put(params_to_shard, SHARDING)
+        # * Continue from the warm-up's final state and step size to ensure continuity between the two stages.
+        # * carry layout: (state, counter, key, step_size, num_accepted, avg_mh_ratio); we reuse state[0] and step_size[3].
+        main_init_params = (warm_carry_state[0], warm_carry_state[3])
+        sharded_params = jax.device_put(main_init_params, SHARDING)
         self.init_key, sub_key = jax.random.split(self.init_key)
         sharded_keys = jax.random.split(sub_key, self.parallel_chains)
         sharded_keys = jax.device_put(sharded_keys, SHARDING)
@@ -253,7 +254,6 @@ class MetropolisAdjustedLangevinSampler:
     
     @jax.jit(static_argnums=(0,))
     def compute_mcmc_diagnostics(self, samples: Array) -> dict:
-        samples = jnp.log(samples)
         rhat_stats = self.compute_normalized_rank_split(samples)
         ebmfi = self.compute_ebfmi(samples)
         return rhat_stats | {"ebfmi": ebmfi}

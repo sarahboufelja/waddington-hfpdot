@@ -37,3 +37,71 @@ def test_viz_helpers_live_in_separate_module():
         "plot_transport_plans_traces",
     ):
         assert hasattr(viz, name), f"sampler_viz missing {name}"
+
+
+# =========================================================================== #
+# Engine integration tests (issue #2): does the sampler actually target the
+# distribution? We use a correlated 2-D Gaussian where the answer is known in
+# closed form, exercising warm-up -> mass-matrix -> adapted main stage.
+# =========================================================================== #
+import jax
+import jax.numpy as jnp
+
+
+def _correlated_gaussian(mu, sigma):
+    """Return (log_prob, score) for N(mu, sigma) acting on states shaped (1, d)."""
+    precision = jnp.linalg.inv(sigma)
+
+    def log_prob(x):
+        d = x - mu
+        return -0.5 * jnp.sum((d @ precision) * d)
+
+    def score(x):
+        return -(x - mu) @ precision
+
+    return log_prob, score
+
+
+def _build_sampler(**overrides):
+    from langevin_sampler import MetropolisAdjustedLangevinSampler
+
+    mu = jnp.array([1.0, -1.0])
+    sigma = jnp.array([[1.0, 0.8], [0.8, 1.0]])
+    log_prob, score = _correlated_gaussian(mu, sigma)
+    kwargs = dict(
+        target_log_prob_fn=log_prob,
+        target_score_fn=score,
+        shape=2,
+        support="unconstrained",
+        num_parallel_chains=4,
+        num_samples=2500,
+        num_burnin=1200,
+        warm_up_steps=600,
+        step_size=0.3,
+    )
+    kwargs.update(overrides)
+    sampler = MetropolisAdjustedLangevinSampler(**kwargs)
+    sampler.init_key = jax.random.key(0)  # pin randomness for the test
+    return sampler, mu, sigma
+
+
+def test_sampler_recovers_correlated_gaussian_moments():
+    sampler, mu, sigma = _build_sampler()
+    samples, num_accepted, _, _ = sampler.sample(with_diagnostics=False)
+
+    est_mean = jnp.mean(samples, axis=0)
+    est_cov = jnp.cov(samples.T)
+    assert jnp.allclose(est_mean, mu, atol=0.1), est_mean
+    assert jnp.allclose(est_cov, sigma, atol=0.15), est_cov
+
+    # Robbins-Monro adaptation should drive the final acceptance near TARGET_ACCEPT=0.574.
+    final_accept = num_accepted[:, -1, 0] / sampler.tot_num_samples
+    assert jnp.all(final_accept > 0.4) and jnp.all(final_accept < 0.75), final_accept
+
+
+def test_sampler_is_reproducible_under_fixed_key():
+    s1, _, _ = _build_sampler(num_samples=300, num_burnin=100, warm_up_steps=100, num_parallel_chains=2)
+    s2, _, _ = _build_sampler(num_samples=300, num_burnin=100, warm_up_steps=100, num_parallel_chains=2)
+    out1, _, _, _ = s1.sample(with_diagnostics=False)
+    out2, _, _, _ = s2.sample(with_diagnostics=False)
+    assert jnp.array_equal(out1, out2)
