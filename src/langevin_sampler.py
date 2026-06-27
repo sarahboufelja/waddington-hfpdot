@@ -1,11 +1,6 @@
-import matplotlib.pyplot as plt
-from matplotlib.pyplot import step
 import numpy as np
 import logging
 import os
-
-import multiprocessing
-from torch import threshold
 
 os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -18,10 +13,10 @@ from jax import Array
 import jax.numpy as jnp
 from jax.scipy.special import ndtri
 import jax.scipy.stats as stats
-from blackjax.diagnostics import potential_scale_reduction, effective_sample_size
 from jax.scipy.special import logsumexp
 from jax.experimental import mesh_utils
-from typing import Callable, Tuple
+from typing import Tuple, Literal
+from supports import make_support, LogProbFn, ScoreFn
 
 # Set up the XLA flag to use jax.pmap on CPU
 # os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={multiprocessing.cpu_count()}"
@@ -30,7 +25,8 @@ devices = mesh_utils.create_device_mesh((jax.local_device_count(),))
 MESH = Mesh(devices, axis_names=("chains", ))
 SHARDING = NamedSharding(MESH, P("chains"))
 
-jax.config.update("jax_enable_x64", False)
+# NB: do not force x64 on/off at import — that leaks into any importing process
+# (e.g. the test suite). Precision is a runtime choice of the caller.
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -41,25 +37,25 @@ TARGET_ACCEPT = 0.574
 class MetropolisAdjustedLangevinSampler:
     """
     Implements the Metropolis-Adjusted Langevin Algorithm (MALA) transition kernel for MCMC sampling in very high-dimensional
-    spaces, with optional support for sampling from distributions constrained to the simplex. The kernel uses a preconditioned
+    spaces, with optional support for sampling from distributions constrained to the simplex or positive orthant. The kernel uses a preconditioned
     Langevin update step, followed by a Metropolis-Hastings correction step to ensure detailed balance and convergence
     to the target distribution.
     """
 
     def __init__(
         self,
-        target_log_prob_fn: Callable,
-        target_score_fn: Callable,
+        target_log_prob_fn: LogProbFn,
+        target_score_fn: ScoreFn,
+        radial_log_prob_fn: LogProbFn | None = None,
+        radial_score_fn: ScoreFn | None = None,
         alpha: float| None = 0.5,
-        regular_log_prob_fn: Callable | None = None,
-        regular_score_fn: Callable | None = None,
         shape: int = 10,
-        sample_from_simplex: bool = True,
+        support: Literal["simplex", "positive_orthant", "unconstrained"] = "unconstrained",
         num_samples: int = 8_000,
         num_burnin: int = 8_000,
         warm_up_steps: int = 500,
         step_size: float = 0.1,
-        num_parallel_chains: int = jax.local_device_count()
+        num_parallel_chains: int = jax.local_device_count(),
     ):
         """Initializes the MetropolisAdjustedLangevinSampler transition kernel.
 
@@ -76,10 +72,9 @@ class MetropolisAdjustedLangevinSampler:
             `current_state`.
             kernel_results: `collections.namedtuple` of internal calculations used to advance the chain.
         """
-        self.target_log_prob_fn = target_log_prob_fn
-        self.target_score_fn = target_score_fn
+        self.target_log_prob_function = target_log_prob_fn
+        self.target_score_function = target_score_fn
         self.shape = shape
-        self.sample_from_simplex = sample_from_simplex
         self.parallel_chains = num_parallel_chains
         self.num_burnin = num_burnin
         self.warm_up_steps = warm_up_steps
@@ -89,75 +84,16 @@ class MetropolisAdjustedLangevinSampler:
         self.num_samples = num_samples
         self.tot_num_samples = self.num_samples + self.num_burnin
 
-        if self.sample_from_simplex:
-            self.regular_score_fn = regular_score_fn if regular_score_fn else self._gaussian_score_func
-            self.regular_log_prob_fn = regular_log_prob_fn if regular_log_prob_fn else self._gaussian_log_prob_func
-            self.score_function = self._extended_score_function
-            self.log_prob_function = self._extended_log_prob_fn
-        else:
-            self.score_function = self.target_score_fn
-            self.log_prob_function = self.target_log_prob_fn
-
-
-    def _extended_log_prob_fn(self, current_state: Array) -> float:
-        """
-        Evaluates the extended log-probability density function at the current state.
-        The extended log-probability density function is derived via a change of variable and extends the originally
-        -- simplex-constrained -- distribution to $\mathbb{R}^{n+1}$ with the appropriate change of variable.
-        See: https://osf.io/preprints/osf/5zu6m_v1 for the details.
-
-        Args:
-            regular_log_prob_fn (Callable): regular log-probability distribution with non-constrained support.
-            This regular distribution is required for the parametrization.
-            current_state (Iterable): current state to evaluate.
-        """
-        F_t = self._softmax(current_state)
-        r_t = jnp.sum(current_state)
-        n = current_state.shape[-1]
-        return (
-            jnp.log(n)
-            + self.regular_log_prob_fn(r_t)
-            + self.target_log_prob_fn(F_t)
-            + r_t
-            - n * logsumexp(current_state)
+        self.support = make_support(
+            support,
+            radial_log_prob_fn=radial_log_prob_fn,
+            radial_score_fn=radial_score_fn,
         )
 
-    def _extended_score_function(
-        self,
-        state: Array,
-    ) -> Array:
-        """Evaluates the score function of the extended probability distribution in a given state.
-        Args:
-            state (Iterable): current state.
-
-        Returns:
-            Iterable: the extended score function evaluated in the state.
-        """
-        n = state.shape[-1]
-        softmax_s = self._softmax(state)
-        return (
-           self.regular_score_fn(jnp.sum(state))
-            + self.target_score_fn(softmax_s)
-            + 1
-            - n * softmax_s
-        )
-
-    def _gaussian_log_prob_func(self, x: Array, loc: float = 0.0, scale: float = 1.0):
-        """Univariate Gaussian distribution
-
-        Args:
-            x (_type_): _description_
-            loc (_type_, optional): _description_. Defaults to 0..
-            scale (_type_, optional): _description_. Defaults to 1..
-
-        Returns:
-            _type_: _description_
-        """
-        return jax.scipy.stats.norm.logpdf(x, loc, scale)
-
-    def _gaussian_score_func(self, x: Array, loc: float = 0.0, scale: float = 1.0):
-        return - (x - loc) / (scale ** 2)
-
+        self.latent_log_prob_function = lambda x: self.support.latent_log_prob(self.target_log_prob_function, x)
+        self.latent_score_function = lambda x: self.support.latent_score(self.target_score_function, x)
+    
+    
     def sample(
         self,
         with_diagnostics: bool = True,):
@@ -165,32 +101,20 @@ class MetropolisAdjustedLangevinSampler:
         # Sample with multiple chains and run diagnostics
         samples, num_accepted_samples, mh_log_ratio = self.inference_loop_multiple_chains()
 
-        # Remove the burn-in samples
-        samples = samples[:, self.num_burnin:, :]
-        
-        # Flatten samples across chains so the shape is (num_chains * num_samples, sample_dim).
-        samples = jnp.reshape(samples, shape=(samples.shape[0] * samples.shape[1], samples.shape[3]))
-        if self.sample_from_simplex:
-            # Applies the softmax across the third axis to project samples back to the simplex
-            samples = jax.nn.softmax(samples, axis=-1)
-        # If we need strictly positive non-simplex samples, we exponentiate them, because
-        # the MCMC traces are in the log domain.
-        elif not self.sample_from_simplex:
-            samples = jnp.exp(samples)
-        
-        jax.debug.print("samples after flattening: {x}", x=samples.shape)
+        # Remove the burn-in samples: (num_chains, num_kept, 1, sample_dim).
+        samples = samples[:, self.num_burnin:]
 
-        if with_diagnostics:
-            diag = self.compute_mcmc_diagnostics(samples)
-        else:
-            diag = None
+        # Flatten chains and samples into (num_chains * num_kept, sample_dim). These are
+        # still latent (unconstrained) states; the projection to the target space is below.
+        num_chains, num_kept = samples.shape[0], samples.shape[1]
+        latent_samples = jnp.reshape(samples, (num_chains * num_kept, self.shape))
 
-        # The positivity of the unbalanced transport plans is ensured by taking the abs value of the samples.
-        return samples, num_accepted_samples, diag, mh_log_ratio
+        # Diagnostics are assessed in the latent sampling space.
+        diag = self.compute_mcmc_diagnostics(latent_samples) if with_diagnostics else None
 
-    @staticmethod
-    def _softmax(state: Array):
-        return jax.nn.softmax(state, axis=-1)
+        # Project back to the constrained target space (simplex / positive orthant / identity).
+        constrained_samples = self.support.to_constrained(latent_samples)
+        return constrained_samples, num_accepted_samples, diag, mh_log_ratio
 
     def initialize_diverse_chains(self, keys):
         # * Initialize the chains with an increasing scale for wider exploration.
@@ -248,6 +172,7 @@ class MetropolisAdjustedLangevinSampler:
                                                                              sharded_keys,
                                                                              False,
                                                                              mass_diag)
+        
         return pmap_states, pmap_num_accepted_samps, pmap_mh_ratio
 
     
@@ -255,7 +180,7 @@ class MetropolisAdjustedLangevinSampler:
         """
         Computes the Bayesian Fraction of Missing Info for each chain, as described in https://arxiv.org/pdf/2202.05483.pdf.
         """
-        energy_history = - jax.vmap(self.log_prob_function)(samples)
+        energy_history = - jax.vmap(self.latent_log_prob_function)(samples)
         # Squeeze the energy_history second dim. so to enable the diff computation across the sample dimension.
         energy_history = jnp.squeeze(energy_history, axis=1)
         jax.debug.print("Energy history: {x}", x=energy_history)
@@ -380,7 +305,7 @@ class MetropolisAdjustedLangevinSampler:
             key, sub_key = jax.random.split(key)
 
             # Compute current gradient
-            current_grad = self.score_function(current_x)
+            current_grad = self.latent_score_function(current_x)
             # jax.debug.print("Current gradient: {x}", x=current_grad)
 
             # Propose a new sample
@@ -389,12 +314,12 @@ class MetropolisAdjustedLangevinSampler:
 
             # MH log-ratio
             mh_log_ratio = (
-                self.log_prob_function(proposed_x)
+                self.latent_log_prob_function(proposed_x)
                 + self.log_proposal_dist(x=current_x,
                                          y=proposed_x,
                                          curr_step_size=step_size,
                                          mass_diag=mass_diag)
-                - self.log_prob_function(current_x)
+                - self.latent_log_prob_function(current_x)
                 - self.log_proposal_dist(x=proposed_x,
                                          y=current_x,
                                          curr_step_size=step_size,
@@ -455,7 +380,7 @@ class MetropolisAdjustedLangevinSampler:
         return states, num_accepted_samples, avg_mh_ratios, carry_state
 
     def log_proposal_dist(self, x: Array, y: Array, curr_step_size: float, mass_diag: Array) -> float:
-        """Computes the log transition probability density function at x given y:
+        r"""Computes the log transition probability density function at x given y:
         log(q(x|y)) \propto - \frac{1}{2 * step**2} \|x - y - 0.5 * step_size * gradient(log_probability_fn)(y)\|**2
 
         Args:
@@ -467,7 +392,7 @@ class MetropolisAdjustedLangevinSampler:
             _type_: _description_
         """
         logger.info("Computing the log transition kernel")
-        diff = x - y - curr_step_size * mass_diag * self.score_function(y)
+        diff = x - y - curr_step_size * mass_diag * self.latent_score_function(y)
         return - 0.5 * jnp.sum(jnp.square(diff) / (2 * curr_step_size * mass_diag))
 
 class HFPDOTHyperprior:
@@ -488,21 +413,21 @@ class HFPDOTHyperprior:
         self.pi_I = jnp.reshape(self.pi_I, (1, -1))
         self.init_key = jax.random.key(int(date.today().strftime("%Y%m%d")))
 
-    def hyperprior_log_prob_fun(self, log_pi: Array) -> float:
+    def hyperprior_log_prob_fun(self, pi: Array) -> float:
         """Evaluates the log-hyperprior at the state $\pi$, a vector of size (1, II x JJ).
         Note that the input is log_pi, the log of pi, to ensure the positivity constraint on pi. The log-hyperprior is derived via a change of variable
         and extends the originally -- positivity-constrained -- distribution to $\mathbb{R}^{II x JJ}$ with the appropriate change of variable.
 
         Args:
-            log_pi (Iterable): _description_
+            pi (Iterable): _description_
 
         Returns:
             float: _description_
         """
-        pi = jnp.exp(log_pi)
         pi_mat = jnp.reshape(pi, (self.II, self.JJ))
         mu = jnp.sum(pi_mat, axis=1)
         nu = jnp.sum(pi_mat, axis=0)
+
         kl1 = - (self.lambda_1 + self.lambda_I_1) * HFPDOTHyperprior.shifted_kl_div(
             mu, self.mu_0
         )
@@ -510,8 +435,8 @@ class HFPDOTHyperprior:
             nu, self.nu_0
         )
         kl3 = - HFPDOTHyperprior.shifted_kl_div(pi, self.pi_I)
-        # Add the jacobian of the determinant of the change of variable pi = exp(log_pi).
-        return kl1 + kl2 + kl3 + jnp.sum(log_pi)
+
+        return kl1 + kl2 + kl3
 
     @staticmethod
     def safe_log(p: Array, epsilon=1e-15)->Array:
@@ -536,7 +461,7 @@ class HFPDOTHyperprior:
     def _softmax(state: Array):
         return jax.nn.softmax(state, axis=-1)
 
-    def hyperprior_score_fun(self, log_pi: Array) -> Array:
+    def hyperprior_score_fun(self, pi: Array) -> Array:
         """Evaluates the score function of the HFPD-OT hyperprior at $\pi$, a vector of size (1, II x JJ)
 
         Args:
@@ -545,10 +470,10 @@ class HFPDOTHyperprior:
         Returns:
             _type_: _description_
         """
-        assert log_pi.shape[1] == self.II * self.JJ
-        pi_mat = log_pi.reshape((self.II, self.JJ))
-        mu = jnp.sum(pi_mat, axis=1)
-        nu = jnp.sum(pi_mat, axis=0)
+        assert pi.shape[1] == self.II * self.JJ
+        mat = pi.reshape((self.II, self.JJ))
+        mu = jnp.sum(mat, axis=1)
+        nu = jnp.sum(mat, axis=0)
         logger.info(f"Shape of the first marginal: {mu.shape}")
         logger.info(f"Shape of the second marginal: {nu.shape}")
         assert mu.shape == self.mu_0.shape
@@ -560,7 +485,7 @@ class HFPDOTHyperprior:
             Computes the gradient of the log-hyperprior with respect to a single entry of the flattened transport plan vector pi.
             Note that the gradient is computed with respect to log_pi, the log of pi, to ensure the positivity constraint on pi.
             """
-            first_grad_term = - HFPDOTHyperprior.safe_log(log_pi[1, idx]) + HFPDOTHyperprior.safe_log(self.pi_I[1, idx]) - 1
+            first_grad_term = - HFPDOTHyperprior.safe_log(pi[1, idx]) + HFPDOTHyperprior.safe_log(self.pi_I[1, idx]) - 1
             # jax.debug.print("Grad first_grad_term: {x}", x=first_grad_term)
             second_grad_term = - (self.lambda_1 + self.lambda_I_1) * (
                 HFPDOTHyperprior.safe_log(mu[idx // self.JJ]) - HFPDOTHyperprior.safe_log(self.mu_0[idx // self.JJ]) + 1
@@ -588,107 +513,3 @@ class HFPDOTHyperprior:
         logger.info("Completed the gradient computation")  
 
         return gradients
-
-def validate_sampler(samples, mu, sigma_diag, reference_samples, base_alpha):
-    import matplotlib.pyplot as plt
-    """
-    Validate the Langevin sampler by checking if the sample mean and variance are close to the true values.
-    
-    :param samples: Description
-    :param mu: Description
-    :param sigma_diag: Description
-    :param base_alpha: Description
-    """
-    D = mu.shape[0]
-    num_samples = samples.shape[0]
-    # Adjust the parameter alpha of the plot to decrease with the sqrt of the number of samples
-    adjusted_alpha = base_alpha / (np.sqrt(num_samples))
-
-    x = np.arange(D)
-
-    # Plot the target mean and std bands
-    plt.plot(x, mu, label="Target Mean", color="red", linestyle="--")
-    plt.fill_between(x, mu - 1.96 * np.sqrt(sigma_diag), mu + 1.96 * np.sqrt(sigma_diag), alpha=0.4, color="red")
-
-    for sample in samples:
-        plt.plot(x, sample, color="blue", alpha=adjusted_alpha)
-    
-    if reference_samples is not None:
-        for ref_sample in reference_samples:
-            plt.plot(x, ref_sample, color="green", alpha=0.3, linestyle=":")
-    
-    from matplotlib.lines import Line2D
-    sample_proxy = Line2D([0], [0], color="blue", alpha=1.0, label="samples")
-    ref_proxy = Line2D([0], [0], color="green", alpha=1.0, linestyle="--", label="reference samples")
-    handles = [
-        Line2D([], [], color="red", linestyle="--", label="Ideal mean"),
-        Line2D([], [], color="red", alpha=0.2, label="1.96 Std bands"),
-        sample_proxy,
-    ]
-    if reference_samples is not None:
-        handles.append(ref_proxy)
-
-    plt.legend(handles=handles)
-
-    plt.xlabel("Dimension")
-    plt.ylabel("Value")
-    plt.tight_layout()
-    plt.show()
-
-
-def validate_hyperprior_sampler(samples, first_marginal, second_marginal, first_uncertainty_radius, second_uncertainty_radius, base_alpha):
-    import matplotlib.pyplot as plt
-
-    D1 = first_marginal.shape[0]
-    D2 = second_marginal.shape[0]
-    x1 = np.arange(D1)
-    x2 = np.arange(D2)
-
-    # Adjust the parameter alpha of the plot to decrease with the sqrt of the number of samples
-    adjusted_alpha = base_alpha / np.sqrt(samples.shape[0])
-
-    for sample in samples:
-        pi_mat = jnp.reshape(sample, (first_marginal.shape[0], second_marginal.shape[0]))
-        mu = jnp.sum(pi_mat, axis=1)
-        nu = jnp.sum(pi_mat, axis=0)
-
-
-
-        # Plot the target first marginal
-        plt.plot(x1, first_marginal, label="Target First Marginal", color="darkblue", linestyle="--")
-        plt.plot(x1, mu, color="red", alpha=adjusted_alpha)
-        plt.xlabel("Dimension of First Marginal")
-        plt.ylabel("Value")
-        plt.tight_layout()
-        plt.show()
-
-        # Plot the target second marginal
-        plt.plot(x2, second_marginal, label="Target Second Marginal", color="darkblue", linestyle="--")
-        plt.plot(x2, nu, color="red", alpha=adjusted_alpha)
-        plt.xlabel("Dimension of Second Marginal")
-        plt.ylabel("Value")
-        plt.tight_layout()
-        plt.show()
-
-def visualise_rhat(rhat_vec, dim):
-    rhat_mat = rhat_vec.reshape(rhat_vec, (dim , dim))
-    plt.figure(figsize=(8, 10))
-    im = plt.imshow(rhat_mat, cmap="YlOrRd", vmin=1, vmax=1.1)
-    plt.title("Convergence heatmap (R-hat)")
-    plt.show()
-
-def plot_transport_plans_traces(samples, num_chains, num_samples):
-    grid_samples = samples.reshape(num_chains, num_samples, 10, 10)
-
-    fig, axes = plt.subplots(10, 10, figsize=(20, 20), sharex=True)
-    for i in range(10):
-        for j in range(10):
-            for chain in range(num_chains):
-                axes[i, j].plot(grid_samples[chain, :, i, j], alpha=0.5)
-            axes[i, j].set_title(f"Entry ({i}, {j})")
-        
-            axes[i, j].set_xticks([])
-            axes[i, j].set_yticks([])
-    plt.tight_layout()
-    plt.show()
-
