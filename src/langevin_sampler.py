@@ -461,7 +461,7 @@ class HFPDOTHyperprior:
     def _softmax(state: Array):
         return jax.nn.softmax(state, axis=-1)
 
-    def hyperprior_score_fun(self, pi: Array) -> Array:
+    def hyperprior_score_fun(self, pi: Array, epsilon: float = 1e-9) -> Array:
         """Evaluates the score function of the HFPD-OT hyperprior at $\pi$, a vector of size (1, II x JJ)
 
         Args:
@@ -471,45 +471,19 @@ class HFPDOTHyperprior:
             _type_: _description_
         """
         assert pi.shape[1] == self.II * self.JJ
-        mat = pi.reshape((self.II, self.JJ))
-        mu = jnp.sum(mat, axis=1)
-        nu = jnp.sum(mat, axis=0)
+        pi_mat = pi.reshape((self.II, self.JJ))
+        pi_I_mat = self.pi_I.reshape(self.II, self.JJ)
+        mu = jnp.sum(pi_mat, axis=1)
+        nu = jnp.sum(pi_mat, axis=0)
         logger.info(f"Shape of the first marginal: {mu.shape}")
         logger.info(f"Shape of the second marginal: {nu.shape}")
         assert mu.shape == self.mu_0.shape
         assert nu.shape == self.nu_0.shape
         logger.info("Initiating the gradient computation")
 
-        def _compute_single_gradient(idx):
-            """
-            Computes the gradient of the log-hyperprior with respect to a single entry of the flattened transport plan vector pi.
-            Note that the gradient is computed with respect to log_pi, the log of pi, to ensure the positivity constraint on pi.
-            """
-            first_grad_term = - HFPDOTHyperprior.safe_log(pi[1, idx]) + HFPDOTHyperprior.safe_log(self.pi_I[1, idx]) - 1
-            # jax.debug.print("Grad first_grad_term: {x}", x=first_grad_term)
-            second_grad_term = - (self.lambda_1 + self.lambda_I_1) * (
-                HFPDOTHyperprior.safe_log(mu[idx // self.JJ]) - HFPDOTHyperprior.safe_log(self.mu_0[idx // self.JJ]) + 1
-            )
-            # jax.debug.print("Grad second_grad_term: {x}", x=second_grad_term)
-            third_grad_term = - (self.lambda_2 + self.lambda_I_2) * (
-                HFPDOTHyperprior.safe_log(nu[idx % self.JJ]) - HFPDOTHyperprior.safe_log(self.nu_0[idx % self.JJ]) + 1
-            )
-            # jax.debug.print("Grad third_grad_term: {x}", x=third_grad_term)
-            grad = first_grad_term + second_grad_term + third_grad_term + 1
-            # * Zero out gradients that have gone off the rails
-            grad = jnp.where(jnp.isfinite(grad), grad, 0)
-            return grad
-        
-        # Estimate gradients in parallel across all cores.
-        p_indices = jnp.arange(self.II * self.JJ)
-        gradients = jax.vmap(_compute_single_gradient)(p_indices)
-        # Clip the gradients' norm to avoid Nans
-        threshold = 1
-        grad_norm = jnp.linalg.norm(gradients)
-        # jax.debug.print("grads before norm: {x}", x=gradients)
-        # jax.debug.print("grad_norm: {x}", x=grad_norm)
-        gradients = jnp.where(grad_norm > threshold, gradients / grad_norm * threshold, gradients)
-        # jax.debug.print("grads after norm: {x}", x=gradients)
-        logger.info("Completed the gradient computation")  
+        grad_mu = -(self.lambda_1 + self.lambda_I_1) * (jnp.log((mu + epsilon) / (self.mu_0 + epsilon)) + 1.0)
+        grad_nu = -(self.lambda_2 + self.lambda_I_2) * (jnp.log((nu + epsilon) / (self.nu_0 + epsilon)) + 1.0)
+        grad_pi = -(jnp.log((pi_mat + epsilon) / (pi_I_mat + epsilon)) + 1.0)
 
-        return gradients
+        grad = grad_pi + jnp.expand_dims(grad_mu, axis=1) + jnp.expand_dims(grad_nu, axis=0)
+        return grad.reshape(pi.shape)

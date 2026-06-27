@@ -1099,18 +1099,19 @@ def get_rand_transport_plans(t1: float,
                                     epsilon=1e-2)
 
     logger.info("Instantiated the HFPD-OT target prior")
-    hfpd_ot_log_density = target_prior.hyperprior_log_prob_fn
+    hfpd_ot_log_density = target_prior.hyperprior_log_prob_fun
     hfpd_ot_score_func = target_prior.hyperprior_score_fun
 
     sampler = MetropolisAdjustedLangevinSampler(target_log_prob_fn=hfpd_ot_log_density,
                                                 target_score_fn=hfpd_ot_score_func,
+                                                num_samples=num_samples,
                                                 num_burnin=num_burnin,
                                                 shape=dim,
-                                                sample_from_simplex=False,
+                                                support="positive_orthant",
                                                 num_parallel_chains=2)
 
     logger.info("Proceeding to sampling from the HFPD-OT target prior.")
-    hfpot_plans, num_accepted_samples, _, mh_log_ratio = sampler.sample(num_samples, with_diagnostics=False,)
+    hfpot_plans, num_accepted_samples, _, mh_log_ratio = sampler.sample(with_diagnostics=False)
     hfpot_plans = hfpot_plans.reshape(-1, len(p0_x), len(p1_x))
     logger.info(f"Size of the sampled HFPDOT plans: {hfpot_plans.shape}")
     logger.info(f"Number of accepted samples: {num_accepted_samples}")
