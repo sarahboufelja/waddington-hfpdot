@@ -1,0 +1,6 @@
+# Development / test / visualization dependencies.
+# The core sampler (langevin_sampler, supports, mcmc_diagnostics) depends only on
+# jax + numpy/scipy. These are extras for testing, reference cross-checks, and plots.
+pytest>=8
+arviz>=0.18          # reference MCMC diagnostics, used for soundness cross-checks
+matplotlib>=3.8      # plotting (sampler_viz, diagnostic visualizations)
