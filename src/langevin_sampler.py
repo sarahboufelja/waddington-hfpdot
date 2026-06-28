@@ -9,10 +9,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from datetime import date
 from jax import Array
 import jax.numpy as jnp
-from jax.scipy.special import ndtri
 from jax.experimental import mesh_utils
 from typing import Tuple, Literal
 from supports import make_support, LogProbFn, ScoreFn
+from mcmc_diagnostics import MCMCDiagnostics
 
 # Set up the XLA flag to use jax.pmap on CPU
 # os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={multiprocessing.cpu_count()}"
@@ -52,7 +52,8 @@ class MetropolisAdjustedLangevinSampler:
         warm_up_steps: int = 500,
         step_size: float = 0.1,
         num_parallel_chains: int = jax.local_device_count(),
-        seed: int = 0
+        seed: int = 0,
+        initial_plan: Array | None = None,
     ):
         """Initializes the MetropolisAdjustedLangevinSampler transition kernel.
 
@@ -77,6 +78,9 @@ class MetropolisAdjustedLangevinSampler:
         self.warm_up_steps = warm_up_steps
         self.step_size = step_size
         self.seed = seed
+        # Optional constrained-space starting point (e.g. an EOT/UOT Sinkhorn plan) to seed
+        # chains near the mode; problem-specific, supplied by the caller (separation of concerns).
+        self.initial_plan = initial_plan
         self.init_key = jax.random.key(self.seed)
         self.alpha = alpha ## smoothing factor of the exponential moving average
         self.num_samples = num_samples
@@ -90,8 +94,11 @@ class MetropolisAdjustedLangevinSampler:
 
         self.latent_log_prob_function = lambda x: self.support.latent_log_prob(self.target_log_prob_function, x)
         self.latent_score_function = lambda x: self.support.latent_score(self.target_score_function, x)
-    
-    
+
+        # Convergence diagnostics operate on the latent sampling space, per chain.
+        self._diagnostics = MCMCDiagnostics(log_prob_fn=self.latent_log_prob_function)
+
+
     def sample(
         self,
         with_diagnostics: bool = True,):
@@ -102,30 +109,36 @@ class MetropolisAdjustedLangevinSampler:
         # Remove the burn-in samples: (num_chains, num_kept, 1, sample_dim).
         samples = samples[:, self.num_burnin:]
 
-        # Flatten chains and samples into (num_chains * num_kept, sample_dim). These are
-        # still latent (unconstrained) states; the projection to the target space is below.
-        num_chains, num_kept = samples.shape[0], samples.shape[1]
-        latent_samples = jnp.reshape(samples, (num_chains * num_kept, self.shape))
+       # Drop the singleton dimension: (num_chains, num_kept, sample_dim).
+        latent_samples = jnp.squeeze(samples, axis=2)
+        
+        # Compute diagnostic metrics in the latent spaces
+        diag = self._diagnostics.summarize(latent_samples) if with_diagnostics else None
 
-        # Diagnostics are assessed in the latent sampling space.
-        diag = self.compute_mcmc_diagnostics(latent_samples) if with_diagnostics else None
-
-        # Project back to the constrained target space (simplex / positive orthant / identity).
-        constrained_samples = self.support.to_constrained(latent_samples)
+        # First flatten the samples then project back to the constrained target space (simplex / positive orthant / identity).
+        flattened_samples = jnp.reshape(latent_samples, (-1, self.shape))
+        constrained_samples = self.support.to_constrained(flattened_samples)
+        
         return constrained_samples, num_accepted_samples, diag, mh_log_ratio
 
     def initialize_diverse_chains(self, keys):
-        # * Initialize the chains with an increasing scale for wider exploration.
-        # * TODO: Use the entropy regularized solution of the unbalanced optimal transport problem to initialize the chains
-        # in a more principled way and facilitate convergence to the target distribution.
-        def _one_chain(key, index):
-            # Spread initial scales across chains; guard the single-chain case (no spread).
-            denom = max(self.parallel_chains - 1, 1)
-            scale = 0.1 + 0.99 * index / denom
-            return jax.random.truncated_normal(key,
-                                               lower = 1e-6,
-                                               upper = 1,
-                                               shape=(self.shape,),) * scale
+        denom = max(self.parallel_chains - 1, 1)
+        if self.initial_plan is not None:
+            # Seed each chain at a slightly perturbed version of the supplied plan (e.g. the
+            # EOT/UOT Sinkhorn solution), mapped to the latent space -- starting inside the
+            # mode's basin rather than the high-entropy interior. The per-chain perturbation
+            # grows mildly across chains to keep enough spread for R-hat to be meaningful.
+            y0 = self.support.to_unconstrained(self.initial_plan.reshape(1, self.shape)).reshape(self.shape)
+
+            def _one_chain(key, index):
+                sigma = 0.1 + 0.2 * index / denom
+                return y0 + sigma * jax.random.normal(key, (self.shape,))
+        else:
+            # Diffuse fallback: increasing scale for wider exploration (single-chain safe).
+            def _one_chain(key, index):
+                scale = 0.1 + 0.99 * index / denom
+                return jax.random.truncated_normal(key, lower=1e-6, upper=1, shape=(self.shape,)) * scale
+
         indices = jnp.arange(self.parallel_chains)
         return jax.vmap(_one_chain)(keys, indices)
 
@@ -176,88 +189,6 @@ class MetropolisAdjustedLangevinSampler:
         
         return pmap_states, pmap_num_accepted_samps, pmap_mh_ratio
 
-    
-    def compute_ebfmi(self, samples: Array) -> float:
-        """
-        Computes the Bayesian Fraction of Missing Info for each chain, as described in https://arxiv.org/pdf/2202.05483.pdf.
-        """
-        energy_history = - jax.vmap(self.latent_log_prob_function)(samples)
-        # Squeeze the energy_history second dim. so to enable the diff computation across the sample dimension.
-        energy_history = jnp.squeeze(energy_history, axis=1)
-        jax.debug.print("Energy history: {x}", x=energy_history)
-        energy_diffs = jnp.diff(energy_history)
-        numerator = jnp.mean(jnp.square(energy_diffs))
-        jax.debug.print("Energy diffs: {x}", x=energy_diffs)
-        denominator = jnp.var(energy_history, axis=-1)
-        jax.debug.print("Energy history: {x}", x=energy_history)
-        bfmi_per_chain = numerator / denominator
-        jax.debug.print("BFMI per chain: {x}", x=bfmi_per_chain)
-        return jnp.min(bfmi_per_chain)
-    
-    def compute_normalized_rank_split(self, samples: Array) -> float:
-        """
-        Computes the rank-normalized split diagnostic.
-        """
-        def _attribute_normal_ranks(samples: Array) -> Array:
-            original_shape = samples.shape
-            flattened_chains = samples.ravel()
-            # Compute the ranks of each element in the flattened array.
-            # Jax will take care of communicating across devices to compute the ranks globally across all chains.
-            ranks = jnp.argsort(jnp.argsort(flattened_chains))
-            # Map to 0-1 with Blom's formula
-            n_total = len(flattened_chains)
-            normalised_ranks = (ranks - 0.375) / (n_total + 0.25)
-            # Transform to z-scores 
-            z_scores = ndtri(normalised_ranks)
-            return z_scores.reshape(original_shape)
-        
-        def _calculate_r_hat_anova(samples: Array) -> Tuple[Array, float, float]:
-            z_scores = _attribute_normal_ranks(samples)
-            # Reshape again to separate the chains and the samples within each chain.
-            # The shape is now (num_chains, num_samples, sample_dim).
-            z_scores = jnp.reshape(z_scores, (self.parallel_chains, -1, self.shape))
-            jax.debug.print("Z-scores shape: {x}", x=z_scores.shape)
-            half_len = z_scores.shape[1] // 2
-            split_chains = jnp.concatenate([z_scores[:, :half_len, :], z_scores[:, half_len:, :]], axis=0)
-            num_chains, num_samples, sample_dim = split_chains.shape
-            jax.debug.print("Shape of split chains: {x}", x=split_chains.shape)
-                
-            chains_means = jnp.nanmean(split_chains, axis=1)
-            chains_vars = jnp.nanvar(split_chains, axis=1, ddof=1)
-
-            # * Compute the inter-chains variance
-            inter_chain_variance = jnp.nanvar(chains_means, axis=0, ddof=1)
-            # * Compute the intra-chains variance
-            intra_chain_variance = jnp.nanmean(chains_vars, axis=0)
-            # * Compute the estimated marginal posterior variance
-            var_plus = ((num_samples - 1) / num_samples) * inter_chain_variance + (1 / num_samples) * intra_chain_variance
-
-            # * Compute the potential scale reduction factor
-            jax.debug.print("var_plus: {x}", x=var_plus)
-            jax.debug.print("intra_chain_variance: {x}", x=intra_chain_variance)
-            jax.debug.print("inter_chain_variance: {x}", x=inter_chain_variance)
-            r_hat = jnp.sqrt(var_plus / jnp.maximum(intra_chain_variance, 1e-12))
-            # * Instead of drowning in high dimensional R_hat, we can use a conservative summary statistic, by taking the maximum plus the mean.
-            r_hat_max = jnp.max(r_hat)
-            r_hat_mean = jnp.mean(r_hat)
-            jax.debug.print("Normalized rank split: {x}", x=r_hat_max)
-            return {"r_hat": r_hat, "r_hat_max": r_hat_max}
-    
-        r_hat_stats = _calculate_r_hat_anova(samples)
-
-        # Folded version of R_hat. Fold samples by taking the absolute distance to the median, to check for convergence issues in the tails of the distribution.
-        median = jnp.median(samples)
-        folded_samples = jnp.abs(samples - median)
-        r_hat_folded_stats = _calculate_r_hat_anova(folded_samples)
-
-        return r_hat_stats | {"r_hat_folded": r_hat_folded_stats["r_hat"], "r_hat_folded_max": r_hat_folded_stats["r_hat_max"]}
-    
-    @jax.jit(static_argnums=(0,))
-    def compute_mcmc_diagnostics(self, samples: Array) -> dict:
-        rhat_stats = self.compute_normalized_rank_split(samples)
-        ebmfi = self.compute_ebfmi(samples)
-        return rhat_stats | {"ebfmi": ebmfi}
-    
     def preconditioned_langevin_update(self, curr_pos, grad, step_size, mass_diag, key):
         z = jax.random.normal(key, shape=(1, self.shape))
         step = step_size * mass_diag * grad
@@ -397,7 +328,8 @@ class MetropolisAdjustedLangevinSampler:
 
 class HFPDOTHyperprior:
     def __init__(
-        self, mu_0, nu_0, lambda_1, lambda_2, lambda_I_1, lambda_I_2, cost_fn, epsilon
+        self, mu_0, nu_0, lambda_1, lambda_2, lambda_I_1, lambda_I_2, cost_fn, epsilon,
+        support: Literal["simplex", "positive_orthant"] = "simplex"
     ):
         self.mu_0 = jnp.asarray(mu_0)
         self.nu_0 = jnp.asarray(nu_0)
@@ -407,13 +339,41 @@ class HFPDOTHyperprior:
         self.lambda_2 = lambda_2
         self.lambda_I_1 = lambda_I_1
         self.lambda_I_2 = lambda_I_2
+        self.support = support
         self.II = len(self.mu_0)
         self.JJ = len(self.nu_0)
         self.pi_I = jnp.exp(- self.cost_fn / self.epsilon)
         self.pi_I = jnp.reshape(self.pi_I, (1, -1))
         self.init_key = jax.random.key(int(date.today().strftime("%Y%m%d")))
 
-    def hyperprior_log_prob_fun(self, pi: Array) -> float:
+    def sinkhorn_init(self, reg_m: float | None = None, num_iter: int = 1000) -> Array:
+        """Sinkhorn solution used to seed the sampler near the mode, returned as (1, II*JJ).
+
+        Balanced ("simplex"): the entropic-OT coupling (``ot.sinkhorn``) matching mu_0, nu_0.
+        Unbalanced ("positive_orthant"): the unbalanced-OT plan (``ot.sinkhorn_unbalanced``)
+        with KL-relaxed marginals; ``reg_m`` (relaxation strength) defaults to the
+        hyperprior's marginal lambdas.
+
+        Uses POT (mature, log-domain stabilized for small epsilon). POT's jax backend is not
+        available with current jax, so this one-time preprocessing runs on CPU (numpy) -- a
+        negligible cost; the sampling loop itself stays on the accelerator. Import is lazy so
+        the generic sampler core does not depend on POT.
+        """
+        import numpy as np
+        import ot
+
+        a = np.asarray(self.mu_0, dtype=float)
+        b = np.asarray(self.nu_0, dtype=float)
+        M = np.asarray(self.cost_fn, dtype=float).reshape(self.II, self.JJ)
+        if self.support == "simplex":
+            plan = ot.sinkhorn(a, b, M, reg=self.epsilon, numItermax=num_iter)
+        else:  # positive_orthant
+            if reg_m is None:
+                reg_m = [self.lambda_1 + self.lambda_I_1, self.lambda_2 + self.lambda_I_2]
+            plan = ot.sinkhorn_unbalanced(a, b, M, reg=self.epsilon, reg_m=reg_m, numItermax=num_iter)
+        return jnp.asarray(plan).reshape(1, -1)
+
+    def balanced_hyperprior_log_prob_fun(self, pi: Array) -> float:
         """Evaluates the log-hyperprior at the state $\pi$, a vector of size (1, II x JJ).
         Note that the input is log_pi, the log of pi, to ensure the positivity constraint on pi. The log-hyperprior is derived via a change of variable
         and extends the originally -- positivity-constrained -- distribution to $\mathbb{R}^{II x JJ}$ with the appropriate change of variable.
@@ -437,10 +397,69 @@ class HFPDOTHyperprior:
         kl3 = - HFPDOTHyperprior.shifted_kl_div(pi, self.pi_I)
 
         return kl1 + kl2 + kl3
+    
+    def unbalanced_hyperprior_log_prob_fun(self, pi: Array) -> float:
+        """Evaluates the log-hyperprior at the state $\pi$, a vector of size (1, II x JJ).
+        Note that the input is log_pi, the log of pi, to ensure the positivity constraint on pi. The log-hyperprior is derived via a change of variable
+        and extends the originally -- positivity-constrained -- distribution to $\mathbb{R}^{II x JJ}$ with the appropriate change of variable.
+
+        Args:
+            pi (Iterable): _description_
+
+        Returns:
+            float: _description_
+        """
+        pi_mat = jnp.reshape(pi, (self.II, self.JJ))
+        mu = jnp.sum(pi_mat, axis=1)
+        nu = jnp.sum(pi_mat, axis=0)
+
+        kl1 = - (self.lambda_1 + self.lambda_I_1) * HFPDOTHyperprior.generalized_kl_div(
+            mu, self.mu_0
+        )
+        kl2 = - (self.lambda_2 + self.lambda_I_2) * HFPDOTHyperprior.generalized_kl_div(
+            nu, self.nu_0
+        )
+        kl3 = - HFPDOTHyperprior.generalized_kl_div(pi, self.pi_I)
+
+        return kl1 + kl2 + kl3
+    
+    def hyperprior_log_prob_fun(self, pi: Array) -> float:
+        """Evaluates the log-hyperprior at the state $\pi$, a vector of size (1, II x JJ).
+        Note that the input is log_pi, the log of pi, to ensure the positivity constraint on pi. The log-hyperprior is derived via a change of variable
+        and extends the originally -- positivity-constrained -- distribution to $\mathbb{R}^{II x JJ}$ with the appropriate change of variable.
+
+        Args:
+            pi (Iterable): _description_
+
+        Returns:
+            float: _description_
+        """
+        if self.support == "simplex":
+            return self.balanced_hyperprior_log_prob_fun(pi)
+        elif self.support == "positive_orthant":
+            return self.unbalanced_hyperprior_log_prob_fun(pi)
+        else:
+            raise ValueError(f"Unsupported support type: {self.support}. Must be 'simplex' or 'positive_orthant'.")
 
     @staticmethod
     def safe_log(p: Array, epsilon=1e-15)->Array:
         return jnp.log(p + epsilon)
+    
+    @staticmethod
+    def generalized_kl_div(p: Array, q: Array, epsilon: float = 1e-9) -> Array:
+        """Computes the generalized KL divergence between two positive measures p and q.
+        Accounts for the case where p and q are not normalized to sum to 1, by balancing the mass.
+        Args:
+            p (NDArray): a probability vector of size (1, II)
+            q (NDArray): a probability vector of size (1, JJ)
+            epsilon (float): the smoothing parameter in the KL.
+
+        Returns:
+            float: _description_
+        """
+        log_ratio = jnp.log((p + epsilon) / (q + epsilon))
+        return jnp.dot((p + epsilon), log_ratio.T) - jnp.sum(p) + jnp.sum(q)
+        
 
     @staticmethod
     def shifted_kl_div(p: Array, q: Array, epsilon: float = 1e-9) -> Array:
@@ -462,13 +481,24 @@ class HFPDOTHyperprior:
         return jax.nn.softmax(state, axis=-1)
 
     def hyperprior_score_fun(self, pi: Array, epsilon: float = 1e-9) -> Array:
-        """Evaluates the score function of the HFPD-OT hyperprior at $\pi$, a vector of size (1, II x JJ)
+        """Score of the HFPD-OT hyperprior at pi (flattened, shape (1, II*JJ)).
+
+        Each term is the generalized-KL gradient log((p+eps)/(q+eps)) with NO
+        additive +1. One score serves BOTH regimes:
+
+          - Unbalanced (positive orthant): the generalized-KL log-prob has gradient
+            log((p+eps)/(q+eps)); this is its exact score.
+          - Balanced (simplex): the (shifted-)KL log-prob gradient would carry a +1
+            per term, i.e. this score plus a *global constant* c. But the simplex
+            lift only uses the score through the centering F*(s - <F,s>); since
+            sum(F)=1 that projection annihilates any constant added to s, so the
+            missing +1 is invisible and this score is still exact on the simplex.
+
+        The positive orthant has no such projection (latent_score = pi*s + 1), so
+        the +1 would survive as a spurious pi*c term -- hence it is dropped here.
 
         Args:
-            pi (NDArray): flattened probability vector of shape (1, nxm)
-
-        Returns:
-            _type_: _description_
+            pi (NDArray): flattened probability vector of shape (1, II*JJ).
         """
         assert pi.shape[1] == self.II * self.JJ
         pi_mat = pi.reshape((self.II, self.JJ))
@@ -481,9 +511,9 @@ class HFPDOTHyperprior:
         assert nu.shape == self.nu_0.shape
         logger.info("Initiating the gradient computation")
 
-        grad_mu = -(self.lambda_1 + self.lambda_I_1) * (jnp.log((mu + epsilon) / (self.mu_0 + epsilon)) + 1.0)
-        grad_nu = -(self.lambda_2 + self.lambda_I_2) * (jnp.log((nu + epsilon) / (self.nu_0 + epsilon)) + 1.0)
-        grad_pi = -(jnp.log((pi_mat + epsilon) / (pi_I_mat + epsilon)) + 1.0)
+        grad_mu = -(self.lambda_1 + self.lambda_I_1) * jnp.log((mu + epsilon) / (self.mu_0 + epsilon))
+        grad_nu = -(self.lambda_2 + self.lambda_I_2) * jnp.log((nu + epsilon) / (self.nu_0 + epsilon))
+        grad_pi = -jnp.log((pi_mat + epsilon) / (pi_I_mat + epsilon))
 
         grad = grad_pi + jnp.expand_dims(grad_mu, axis=1) + jnp.expand_dims(grad_nu, axis=0)
         return grad.reshape(pi.shape)

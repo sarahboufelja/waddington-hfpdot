@@ -3,3 +3,6 @@ __pycache__/
 data/
 .DS_Store
 .ipynb_checkpoints/
+.vscode/
+assets/images/
+.pytest_cache/

@@ -1,0 +1,7 @@
+# Runtime dependencies for the sampler stack (langevin_sampler, supports,
+# mcmc_diagnostics, transport_summary). The full Waddington model
+# (wadd_hfpdot_model.py) has additional heavy deps (torch, wot, anndata, ...).
+jax>=0.4
+numpy>=1.24
+scipy>=1.10
+POT>=0.9          # entropic / unbalanced OT (Sinkhorn) for sampler initialization
