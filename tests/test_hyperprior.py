@@ -91,7 +91,7 @@ def _sample(prior, dim, support, log_prob_fn, step_size):
         warm_up_steps=200, step_size=step_size,
     )
     sampler.init_key = jax.random.key(0)
-    out, _, _, _ = sampler.sample(with_diagnostics=False)
+    out = sampler.sample(with_diagnostics=False).samples.reshape(-1, dim)  # (C, N, dim) -> (C*N, dim)
     return out
 
 

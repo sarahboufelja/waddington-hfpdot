@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import logging
 import os
 
@@ -12,7 +13,7 @@ import jax.numpy as jnp
 from jax.experimental import mesh_utils
 from typing import Tuple, Literal
 from supports import make_support, LogProbFn, ScoreFn
-from mcmc_diagnostics import MCMCDiagnostics
+from mcmc_diagnostics import DiagnosticsSummary, MCMCDiagnostics
 
 # Set up the XLA flag to use jax.pmap on CPU
 # os.environ["XLA_FLAGS"] = f"--xla_force_host_platform_device_count={multiprocessing.cpu_count()}"
@@ -30,6 +31,14 @@ logger.setLevel(logging.DEBUG)
 logger.info(f"Number of devices: {jax.local_devices()}")
 TARGET_ACCEPT = 0.574
 
+@dataclass
+class FinalMalaState:
+    """Holds the final state of the MALA sampler after running inference_loop."""
+    samples: Array
+    num_accepted_samples: Array
+    diagnostics: DiagnosticsSummary
+    mh_log_ratios: Array
+
 class MetropolisAdjustedLangevinSampler:
     """
     Implements the Metropolis-Adjusted Langevin Algorithm (MALA) transition kernel for MCMC sampling in very high-dimensional
@@ -46,6 +55,7 @@ class MetropolisAdjustedLangevinSampler:
         radial_score_fn: ScoreFn | None = None,
         alpha: float| None = 0.5,
         shape: int = 10,
+        sampling_strategy: Literal["low_rank", "full_rank"] = "full_rank",
         support: Literal["simplex", "positive_orthant", "unconstrained"] = "unconstrained",
         num_samples: int = 8_000,
         num_burnin: int = 8_000,
@@ -54,6 +64,8 @@ class MetropolisAdjustedLangevinSampler:
         num_parallel_chains: int = jax.local_device_count(),
         seed: int = 0,
         initial_plan: Array | None = None,
+        warm_start_sigma: tuple[float, float] = (0.1, 0.3),
+        **kwargs,
     ):
         """Initializes the MetropolisAdjustedLangevinSampler transition kernel.
 
@@ -81,23 +93,40 @@ class MetropolisAdjustedLangevinSampler:
         # Optional constrained-space starting point (e.g. an EOT/UOT Sinkhorn plan) to seed
         # chains near the mode; problem-specific, supplied by the caller (separation of concerns).
         self.initial_plan = initial_plan
+        # Per-chain warm-start perturbation scale (lo..hi across chains); over-dispersion
+        # relative to the target is what makes R-hat a meaningful convergence signal.
+        self.warm_start_sigma = warm_start_sigma
         self.init_key = jax.random.key(self.seed)
         self.alpha = alpha ## smoothing factor of the exponential moving average
         self.num_samples = num_samples
         self.tot_num_samples = self.num_samples + self.num_burnin
 
+        # If support low_rank, make the II, JJ, rank and cost required
+        if sampling_strategy == "low_rank":
+            if "II" not in kwargs or "JJ" not in kwargs or "rank" not in kwargs or "cost" not in kwargs:
+                raise ValueError("For low_rank support, II, JJ, rank and cost must be provided as keyword arguments.")
+            if kwargs["II"] <= 0 or kwargs["JJ"] <= 0 or kwargs["rank"] <= 0:
+                raise ValueError("II, JJ and rank must be positive integers.")
+            if kwargs["rank"] > min(kwargs["II"], kwargs["JJ"]):
+                raise ValueError("rank must be less than or equal to min(II, JJ).")
+            if not isinstance(kwargs["cost"], Array):
+                raise ValueError("cost must be a jax.numpy Array.")
+
         self.support = make_support(
             support,
+            sampling_strategy,
             radial_log_prob_fn=radial_log_prob_fn,
             radial_score_fn=radial_score_fn,
+            II=kwargs.get("II", None),
+            JJ=kwargs.get("JJ", None),
+            rank=kwargs.get("rank", None),
+            cost=kwargs.get("cost", None),
+            epsilon=kwargs.get("epsilon", None),
+            ridge=kwargs.get("ridge", 0.0),
         )
 
         self.latent_log_prob_function = lambda x: self.support.latent_log_prob(self.target_log_prob_function, x)
         self.latent_score_function = lambda x: self.support.latent_score(self.target_score_function, x)
-
-        # Convergence diagnostics operate on the latent sampling space, per chain.
-        self._diagnostics = MCMCDiagnostics(log_prob_fn=self.latent_log_prob_function)
-
 
     def sample(
         self,
@@ -110,16 +139,24 @@ class MetropolisAdjustedLangevinSampler:
         samples = samples[:, self.num_burnin:]
 
        # Drop the singleton dimension: (num_chains, num_kept, sample_dim).
-        latent_samples = jnp.squeeze(samples, axis=2)
+        latent_samples = jnp.squeeze(samples, axis=2)  # Shape = (C, D, m) where m = sample_dim
         
-        # Compute diagnostic metrics in the latent spaces
-        diag = self._diagnostics.summarize(latent_samples) if with_diagnostics else None
+        constrained_samples = self.support.to_constrained(latent_samples)  # Shape = (C, D, m) where m = sample_dim
 
-        # First flatten the samples then project back to the constrained target space (simplex / positive orthant / identity).
-        flattened_samples = jnp.reshape(latent_samples, (-1, self.shape))
-        constrained_samples = self.support.to_constrained(flattened_samples)
-        
-        return constrained_samples, num_accepted_samples, diag, mh_log_ratio
+        # Compute diagnostic metrics in the transformed spaces (pi-space)
+        # Convergence diagnostics operate on the latent sampling space, per chain.
+        # eBFMI needs the log-prob, so we pass it to the diagnostics object; R-hat/ESS are gauge-invariant on pi, so we don't need a log-prob for that.
+        self._diagnostics = MCMCDiagnostics(constrained_chains=constrained_samples,
+                                            latent_chains=latent_samples,
+                                            log_prob_fn=self.latent_log_prob_function)
+        diag = self._diagnostics.summarize() if with_diagnostics else None
+
+        return FinalMalaState(
+            samples=constrained_samples,
+            num_accepted_samples=num_accepted_samples,
+            diagnostics=diag,
+            mh_log_ratios=mh_log_ratio
+        )
 
     def initialize_diverse_chains(self, keys):
         denom = max(self.parallel_chains - 1, 1)
@@ -128,10 +165,11 @@ class MetropolisAdjustedLangevinSampler:
             # EOT/UOT Sinkhorn solution), mapped to the latent space -- starting inside the
             # mode's basin rather than the high-entropy interior. The per-chain perturbation
             # grows mildly across chains to keep enough spread for R-hat to be meaningful.
-            y0 = self.support.to_unconstrained(self.initial_plan.reshape(1, self.shape)).reshape(self.shape)
-
+            y0 = self.support.to_unconstrained(self.initial_plan.reshape(1, -1)).reshape(self.shape,)
+            
+            lo, hi = self.warm_start_sigma
             def _one_chain(key, index):
-                sigma = 0.1 + 0.2 * index / denom
+                sigma = lo + (hi - lo) * index / denom
                 return y0 + sigma * jax.random.normal(key, (self.shape,))
         else:
             # Diffuse fallback: increasing scale for wider exploration (single-chain safe).

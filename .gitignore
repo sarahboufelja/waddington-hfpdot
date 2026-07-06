@@ -1,8 +1,13 @@
 __pycache__/
 *.pyc
 data/
+gmvae/
 .DS_Store
 .ipynb_checkpoints/
 .vscode/
 assets/images/
 .pytest_cache/
+
+# uv / virtualenv
+.venv/
+*.egg-info/

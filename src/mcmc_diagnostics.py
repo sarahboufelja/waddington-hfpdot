@@ -12,12 +12,26 @@ References:
   - Betancourt (2016), "Diagnosing Suboptimal Cotangent Disintegrations" (eBFMI).
 """
 
+from dataclasses import dataclass
 from typing import Callable
 
 import jax
 import jax.numpy as jnp
 from jax import Array
 from jax.scipy.special import ndtri
+
+@dataclass
+class DiagnosticsSummary:
+    bulk_rhat: Array
+    bulk_rhat_max: Array
+    tail_rhat: Array
+    tail_rhat_max: Array
+    ess: Array
+    ess_min: Array
+    # None when the diagnostics object was built without a log_prob_fn (e.g. pi-space
+    # R-hat/ESS): eBFMI needs the energy, so it is only populated when a log_prob is given.
+    ebfmi: Array | None = None
+    ebfmi_min: Array | None = None
 
 
 class MCMCDiagnostics:
@@ -28,8 +42,10 @@ class MCMCDiagnostics:
             Required only for :meth:`ebfmi`.
     """
 
-    def __init__(self, log_prob_fn: Callable[[Array], Array] | None = None):
+    def __init__(self,  log_prob_fn: Callable[[Array], Array], constrained_chains: Array, latent_chains: Array | None = None,):
         self.log_prob_fn = log_prob_fn
+        self.constrained_chains = constrained_chains
+        self.latent_chains = latent_chains if latent_chains is not None else constrained_chains # If no latent chains are provided, assume the constrained chains are the latent chains (e.g., for pi-space diagnostics).
 
     # --------------------------------------------------------------------- #
     # Rank-normalized split-R-hat (Vehtari et al. 2021).
@@ -78,7 +94,7 @@ class MCMCDiagnostics:
         return cls._rhat(cls._rank_normalize(cls._split(folded)))
 
     # --------------------------------------------------------------------- #
-    # Effective sample size (autocorrelation-based, multi-chain).
+    # Effective sample size (FFT autocorrelation, multi-chain).
     # --------------------------------------------------------------------- #
     @staticmethod
     def ess(chains: Array) -> Array:
@@ -114,7 +130,7 @@ class MCMCDiagnostics:
 
         rho = 1.0 - (W[None, :] - jnp.mean(acov, axis=0)) / var_plus[None, :]
 
-        # Use Geyer monotone sequebce pver pair of sums
+        # Use Geyer monotone sequence over pair of sums
         K = Nh // 2
         gamma = rho[: 2 * K, :].reshape(K, 2, D).sum(axis=1)
         positive = jnp.cumprod((gamma > 0).astype(chains.dtype), axis=0)
@@ -141,18 +157,16 @@ class MCMCDiagnostics:
         denominator = jnp.var(energies, axis=1)
         return numerator / jnp.maximum(denominator, 1e-12)
 
-    # --------------------------------------------------------------------- #
     @staticmethod
     def acceptance_rate(num_accepted: Array, num_steps: int) -> Array:
         """Acceptance fraction per chain from the cumulative accepted count."""
         return jnp.asarray(num_accepted) / num_steps
 
-    # --------------------------------------------------------------------- #
-    def summarize(self, chains: Array) -> dict:
+    def summarize(self) -> DiagnosticsSummary:
         """Compute the full diagnostic suite and conservative scalar summaries."""
-        bulk = self.bulk_rhat(chains)
-        tail = self.tail_rhat(chains)
-        ess = self.ess(chains)
+        bulk = self.bulk_rhat(self.constrained_chains)
+        tail = self.tail_rhat(self.constrained_chains)
+        ess = self.ess(self.constrained_chains)
         out = {
             "bulk_rhat": bulk,
             "bulk_rhat_max": jnp.max(bulk),
@@ -161,7 +175,6 @@ class MCMCDiagnostics:
             "ess": ess,
             "ess_min": jnp.min(ess),
         }
-        if self.log_prob_fn is not None:
-            ebfmi = self.ebfmi(chains)
-            out |= {"ebfmi": ebfmi, "ebfmi_min": jnp.min(ebfmi)}
-        return out
+        ebfmi = self.ebfmi(self.latent_chains) 
+        out |= {"ebfmi": ebfmi, "ebfmi_min": jnp.min(ebfmi)}
+        return DiagnosticsSummary(**out)

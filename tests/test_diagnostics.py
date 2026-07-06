@@ -84,10 +84,9 @@ def test_ess_much_smaller_for_autocorrelated_chains():
 # --------------------------------------------------------------------------- #
 def test_ebfmi_well_mixed_exceeds_sticky():
     log_prob = lambda x: -0.5 * jnp.sum(x ** 2)
-    diag = MCMCDiagnostics(log_prob_fn=log_prob)
-
     well_mixed = _iid_chains(jax.random.key(5))
     sticky = _ar1_chains(jax.random.key(6), phi=0.99)
+    diag = MCMCDiagnostics(log_prob_fn=log_prob, constrained_chains=well_mixed)
 
     bfmi_mixed = diag.ebfmi(well_mixed)
     bfmi_sticky = diag.ebfmi(sticky)
@@ -98,8 +97,9 @@ def test_ebfmi_well_mixed_exceeds_sticky():
 
 
 def test_ebfmi_requires_log_prob_fn():
+    ch = _iid_chains(jax.random.key(7))
     with pytest.raises(ValueError):
-        MCMCDiagnostics().ebfmi(_iid_chains(jax.random.key(7)))
+        MCMCDiagnostics(log_prob_fn=None, constrained_chains=ch).ebfmi(ch)
 
 
 # --------------------------------------------------------------------------- #
@@ -112,11 +112,10 @@ def test_acceptance_rate():
 
 def test_summarize_keys_and_scalars():
     log_prob = lambda x: -0.5 * jnp.sum(x ** 2)
-    diag = MCMCDiagnostics(log_prob_fn=log_prob)
-    out = diag.summarize(_iid_chains(jax.random.key(8)))
-    for key in ("bulk_rhat_max", "tail_rhat_max", "ess_min", "ebfmi_min"):
-        assert key in out
-        assert jnp.ndim(out[key]) == 0
+    ch = _iid_chains(jax.random.key(8))
+    out = MCMCDiagnostics(log_prob_fn=log_prob, constrained_chains=ch, latent_chains=ch).summarize()
+    for attr in ("bulk_rhat_max", "tail_rhat_max", "ess_min", "ebfmi_min"):
+        assert jnp.ndim(getattr(out, attr)) == 0
 
 
 # --------------------------------------------------------------------------- #

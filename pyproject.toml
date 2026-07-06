@@ -1,0 +1,44 @@
+[project]
+name = "waddington-hfpdot"
+version = "0.1.0"
+description = "A scalable, diagnostics-first MCMC sampler for high-dimensional randomized optimal-transport plans (HFPD-OT)."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Sarah Boufelja Yacobi" }]
+# license: TODO — pick one (the reference paper is CC-BY; the code license is the author's call).
+
+# Runtime deps for the sampler stack (langevin_sampler, supports, mcmc_diagnostics,
+# transport_summary). The full Waddington model (wadd_hfpdot_model.py) pulls heavier
+# extras (torch, wot, anndata, ...) that are intentionally NOT declared here.
+dependencies = [
+    "jax>=0.4",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "POT>=0.9",          # entropic / unbalanced OT (Sinkhorn) for sampler initialization
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "arviz>=0.18",       # reference MCMC diagnostics, used for soundness cross-checks
+    "matplotlib>=3.8",   # plotting (sampler_viz, diagnostic visualizations)
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+# Flat `src/` layout: the modules are imported by bare name (`import langevin_sampler`,
+# `from supports import ...`). `package-dir = {"" = "src"}` puts them on the path on an
+# (editable) install, so those bare imports keep working WITHOUT turning src/ into a
+# namespaced package. This is deliberate -- namespacing would force every import to move.
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = [
+    "langevin_sampler",
+    "supports",
+    "mcmc_diagnostics",
+    "transport_summary",
+    "sampler_viz",
+    "wadd_hfpdot_model",
+]

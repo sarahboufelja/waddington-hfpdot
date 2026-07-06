@@ -87,7 +87,9 @@ def _build_sampler(**overrides):
 
 def test_sampler_recovers_correlated_gaussian_moments():
     sampler, mu, sigma = _build_sampler()
-    samples, num_accepted, _, _ = sampler.sample(with_diagnostics=False)
+    state = sampler.sample(with_diagnostics=False)
+    num_accepted = state.num_accepted_samples
+    samples = state.samples.reshape(-1, state.samples.shape[-1])  # (C, N, d) -> (C*N, d)
 
     est_mean = jnp.mean(samples, axis=0)
     est_cov = jnp.cov(samples.T)
@@ -102,6 +104,6 @@ def test_sampler_recovers_correlated_gaussian_moments():
 def test_sampler_is_reproducible_under_fixed_key():
     s1, _, _ = _build_sampler(num_samples=300, num_burnin=100, warm_up_steps=100, num_parallel_chains=2)
     s2, _, _ = _build_sampler(num_samples=300, num_burnin=100, warm_up_steps=100, num_parallel_chains=2)
-    out1, _, _, _ = s1.sample(with_diagnostics=False)
-    out2, _, _, _ = s2.sample(with_diagnostics=False)
+    out1 = s1.sample(with_diagnostics=False).samples
+    out2 = s2.sample(with_diagnostics=False).samples
     assert jnp.array_equal(out1, out2)
