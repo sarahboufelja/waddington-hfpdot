@@ -5,7 +5,7 @@ description = "A scalable, diagnostics-first MCMC sampler for high-dimensional r
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Sarah Boufelja Yacobi" }]
-# license: TODO — pick one (the reference paper is CC-BY; the code license is the author's call).
+license = { text = "MIT" }
 
 # Runtime deps for the sampler stack (langevin_sampler, supports, mcmc_diagnostics,
 # transport_summary). The full Waddington model (wadd_hfpdot_model.py) pulls heavier

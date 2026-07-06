@@ -56,7 +56,7 @@ sampler (ESS 5–17, R̂ 3.1) into one whose **plan marginals mix well** (ESS ~1
 Critically, we **do not claim convergence** at this stage: the low **eBFMI (0.03)**, well under the ~0.3
 healthy threshold, shows energy-space exploration is still poor. R̂ and ESS are *marginal*
 diagnostics on `π`; eBFMI is the energy signal, and it is the honest one here — improving it
-is open work (see Roadmap). See [`docs/derivation_lowrank.md`](docs/derivation_lowrank.md)
+is open work (see Roadmap). See [`docs/mathematical_derivation.md`](docs/mathematical_derivation.md)
 for the mathematics.
 
 Reproduce: `python scripts/run_lowrank_bridge.py`.
@@ -121,6 +121,18 @@ right space, not assumed).
 
 ---
 
+## Software & hardware
+
+- **Software.** Built on **JAX** — `jit` + `vmap` + `jax.sharding` (a `Mesh` over the
+  available devices) drive the multi-chain MALA kernel and the batch-aware `Support`
+  transforms from a single code path, on CPU or GPU. Python ≥ 3.10, dependencies pinned
+  with **uv** (`pyproject.toml` + `uv.lock`).
+- **Hardware.** Developed and benchmarked on an **HP Z8 Fury G5 Workstation** with **two
+  NVIDIA GPUs**; chains shard one-per-device (the 4-chain runs above map directly onto the
+  two-GPU box), with a clean fallback to CPU.
+
+---
+
 ## The gauge, and the ridge
 
 The low-rank factorization has a `GL(r)` gauge (`(U,V) → (UR, VR⁻ᵀ)` leaves `π`
@@ -155,6 +167,11 @@ principled replacements are on the roadmap.
 - M. Cuturi. *Sinkhorn distances*. **NeurIPS** 2013. · G. Peyré, M. Cuturi.
   *Computational Optimal Transport*. **FnT ML** 2019.
 
-## Citation
+## License and citation
 
-If you use this software, please cite the HFPD-OT paper above.
+Released under the **MIT License** ([`LICENSE`](LICENSE)) — © 2026 Sarah Boufelja Yacobi and
+Imperial College London.
+
+If you use this software, please cite **both** the software and the HFPD-OT paper above. A
+machine-readable [`CITATION.cff`](CITATION.cff) is included (GitHub renders a "Cite this
+repository" button from it).

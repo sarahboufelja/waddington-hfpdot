@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite both the software and the paper (preferred-citation) below."
+title: "waddington-hfpdot"
+abstract: "A scalable, diagnostics-first MCMC sampler for high-dimensional randomized optimal-transport plans (HFPD-OT)."
+type: software
+authors:
+  - family-names: "Boufelja Yacobi"
+    given-names: "Sarah"
+    affiliation: "Imperial College London"
+license: MIT
+repository-code: "https://github.com/sarahboufelja/waddington-hfpdot"
+keywords:
+  - optimal transport
+  - fully probabilistic design
+  - Bayesian inference
+  - MCMC
+  - Langevin
+preferred-citation:
+  type: article
+  title: "Randomized transport plans via hierarchical fully probabilistic design"
+  authors:
+    - family-names: "Boufelja Yacobi"
+      given-names: "Sarah"
+    - family-names: "Quinn"
+      given-names: "Anthony"
+    - family-names: "Shorten"
+      given-names: "Robert"
+  journal: "Information Sciences"
+  volume: 718
+  start: 122365   # article number
+  year: 2025
+  doi: "10.1016/j.ins.2025.122365"
