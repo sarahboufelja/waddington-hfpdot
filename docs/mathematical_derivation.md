@@ -19,14 +19,19 @@ fixing) and point 3 (matrix-free determinant) are WIP.
       θ  --(bilinear, low-rank)-->  ℓ = U Vᵀ − C/ε  =  log π   --(exp, = PositiveOrthant, softmax, = Probability Simplex)-->  π
   i.e. `π_ij = exp( (UVᵀ)_ij − C_ij/ε )` or `π_ij = softmax( (UVᵀ)_ij − C_ij/ε )`.
 
+We write: `Φ := (softmax/exp) ∘ (θ ↦ UVᵀ − C/ε)` the composite map `θ → π`.
+
 - The inner layer `ℓ ↦ π = exp(ℓ)` is exactly our tested `PositiveOrthant` support
   (`to_constrained = exp`, `log_det = Σℓ`, `latent_score = π⊙s + 1`) -- `s` being our target hyperprior score function.
 - The outer layer `θ ↦ ℓ` is new, and is **linear in ℓ** (bilinear in θ).
 - **The dual potentials case is the r = 2 special case**: `U = [f/ε, 𝟙]`, `V = [𝟙, g/ε]` gives
   `ℓ_ij = (f_i + g_j − C_ij)/ε`, the entropic-OT dual potentials (Sinkhorn). Use this both
   as a warm start and as a correctness oracle.
-- Effective (with balanced gauge) parameter count `m = r(II + JJ)` (see §2). For `II=JJ=10³,
-  r=5`: `m ≈ 10⁴` vs `n = 10⁶`.
+- **Raw parameter count** `dim θ = r(II + JJ)` — what MALA actually samples. The `GL(r)`
+  gauge (§2) has dimension `r²`, so the **intrinsic dimension** of the image manifold `M_Φ`
+  — the Hausdorff dimension used by `ℋ^m` and `G` throughout — is
+  `m := dim M_Φ = r(II + JJ) − r²`, reached by the **canonical balanced gauge** fix. For
+  `II=JJ=10³, r=5`: `dim θ ≈ 10⁴`, `m = dim θ − 25`, vs `n = 10⁶`.
 
 ---
 
@@ -38,21 +43,43 @@ Ordinary change-of-variables (the `|det J|` formula) requires a **diffeomorphism
 spaces of equal dimension**: `J` square, `q(θ) = p(φ(θ))·|det J|`. That is the classic regime encoded in
 `supports.py` (e.g. orthant `y∈ℝⁿ → x∈ℝⁿ`, `log|det J| = Σy`).
 
-The Low Rank tranformation is different and the reason is twofold:
+The low-rank transformation is different, and the reason is twofold:
 
-1. **Rectangular Jacobian.** `Φ: θ∈ℝ^m → π∈ℝⁿ` with `m ≪ n`. Its Jacobian `J = DΦ` is
+1. **Rectangular Jacobian.** The Jacobian of the map `Φ`: `J = DΦ` is
    `n×m` (tall). A non-square matrix has **no determinant** — `|det J|` is undefined.
-2. **Measure-zero image.** `M = Φ(ℝ^m)` is a thin submanifold of `ℝⁿ` (Lebesgue-null).
-   We are not transporting a density across a bijection; we are **restricting** a density
-   to `M`. Restriction to a null set is not change-of-variables — it requires *choosing a
-   reference measure on `M`*. The canonical choice is the `m`-dim **Hausdorff (surface)
-   measure** `ℋ^m`.
+2. **Measure-zero image.** `M_Φ = Φ(ℝ^m) ⊂ ℝⁿ` is a thin `m`-dimensional submanifold of the *ambient* `ℝⁿ` and, since `m < n`, is **Lebesgue-null in `ℝⁿ`**. Even though each `π` is full matrix rank (the Hadamard exponential destroys the rank‑`r` structure of a single plan), the *family* `M_Φ` has only as many degrees of freedom as `θ`, namely `m`.
+
+We are not transporting a density across a bijection; we are **restricting** a density to `M_Φ`. Restriction to a null set is not change-of-variables — it requires *choosing a reference measure on `M_Φ`*. The canonical choice is the `m`-dim **Hausdorff measure** `ℋ^m`.
 
 ### 1.2 The area formula
 
-For `Φ` injective with `m ≤ n`, the area formula of geometric measure theory gives
+Write the **Jacobian factor** `J_Φ(θ) := √det( DΦ(θ)ᵀ DΦ(θ) )`. For **any** Lipschitz
+`Φ: ℝ^m → ℝ^n` with `m ≤ n`, the area formula of geometric measure theory (Federer 1969,
+Thm 3.2.3; Evans–Gariepy 2015, §3.3) states, for every integrable `g` on `ℝ^m`,
 
-    ∫_M f dℋ^m  =  ∫_{ℝ^m} f(Φ(θ)) · √det( DΦ(θ)ᵀ DΦ(θ) ) dθ.
+    ∫_{ℝ^m} g(θ) J_Φ(θ) dθ  =  ∫_{ℝ^n} ( Σ_{θ ∈ Φ⁻¹(y)} g(θ) ) dℋ^m(y).      (general)
+
+The inner sum runs over the **fibre** `Φ⁻¹(y)`; its size is the counting measure
+`N(y) := ℋ⁰(Φ⁻¹(y))` — the multiplicity with which `Φ` covers `y`. This multiplicity is the
+term that must be tracked; it is *not* `ℋ^m` of the fibre.
+
+We only ever integrate a function *of the plan*, so specialize `g = f∘Φ` for a test function
+`f` on the image. Then `g(θ) = f(y)` for every `θ` in the fibre of `y`, the inner sum becomes
+`f(y)·N(y)`, and
+
+    ∫_{ℝ^m} f(Φ(θ)) J_Φ(θ) dθ  =  ∫_{ℝ^n} f(y) · N(y) dℋ^m(y).                (pulled back)
+
+Two assumptions of our problem now collapse `N`:
+
+- **Gauge-fixing ⇒ injectivity (§2).** The raw map is *not* injective — the `GL(r)` gauge
+  `(U,V)→(UR,VR⁻ᵀ)` makes each fibre an `r²`-dimensional orbit, so `N ≡ ∞`, `DΦ` is
+  rank-deficient, `J_Φ = 0` a.e., and *(pulled back)* degenerates to `0 = 0`. On the
+  gauge-fixed section `Φ` is injective, so `N(y) = 1` on `M_Φ` and `0` off it, i.e.
+  `N ≡ 1_{M_Φ}`.
+
+Substituting `N ≡ 1_{M_Φ}` gives the identity we actually use:
+
+    ∫_{M_Φ} f dℋ^m  =  ∫_{ℝ^m} f(Φ(θ)) J_Φ(θ) dθ.                             (ours)
 
 The columns of `J = DΦ` are the `m` tangent vectors `∂Φ/∂θ_k`. `G := JᵀJ` is their **Gram
 matrix**, and `√det G` is the **`m`-volume of the parallelepiped** they span in the ambient
@@ -69,13 +96,21 @@ support is the `m=n` corner of the *same* formula. Hence
 
 ### 1.4 The target density on θ
 
-Restricting the HFPD-OT posterior `p(π)` to `M` w.r.t. `ℋ^m`, pulled back to θ:
+`M_S`, the support of the HFPD-OT hyper-prior, is full-dimensional. On the other hand, and as per §1.1, `M_Φ` is Lebesgue-null. This has important implications on the uncertainty representation power of `π` (subtle, will be fully discussed separately).
+
+Restricting the HFPD-OT posterior `p(π)` to `M_Φ` w.r.t. `ℋ^m`, pulled back to θ:
 
     ┌─────────────────────────────────────────────────────────────────────┐
     │  log q(θ) = log p( π(θ) )  +  ½ log det G(θ)  +  const               │
     │            G = JᵀJ ,   J = ∂(π(θ))/∂θ_free                       │
     └─────────────────────────────────────────────────────────────────────┘
 
+- `θ_free` are the **canonical balanced gauge** coordinates (§2): the `m = r(II+JJ) − r²`
+  directions transverse to the `GL(r)` orbit. This is load-bearing — on the raw sampled
+  `θ ∈ ℝ^{r(II+JJ)}` the orbit lies in `ker J`, so `G = JᵀJ` is rank-deficient by exactly
+  `r²`, `det G = 0`, and `½ log det G = −∞`. The volume term is well-defined **only** on the
+  section; §2 (Faddeev–Popov) is how sampling on the raw `θ` recovers it — and why v1's ridge
+  is a stopgap for the missing term.
 - `log p(π(θ))` is the existing HFPD-OT hyperprior (balanced shifted-KL on the proba. simplex,
   or unbalanced generalized-KL on the pos. orthant), evaluated at the reconstructed plan.
 - `½ log det G` is the **induced-volume (Riemannian) Jacobian** from §1.2.
@@ -190,16 +225,15 @@ symmetric form; globally better-conditioned but needs Stiefel-style constrained 
 
 ### 2.5 No separate Faddeev–Popov determinant in the direct parametrization
 
-Two equivalent routes; the direct one is what we implement:
-- **Direct (implemented).** Parametrize `M` *directly* by the section `S`. The target is the
-  area formula for `S → M`: `p(π) · √det G_S`, with `G_S` the embedding Gram restricted to the
-  section's free coordinates — now **full rank**, so `½ log det G_S` is finite. **There is no
-  extra FP determinant**: "gauge fixing" *is* "evaluate the §1 volume term on the section
-  tangent, where the `r²` kernel directions are gone."
-- **Factor-out (Faddeev–Popov).** Starting from the full-`θ` integral and factoring out the
-  group, `∫_Θ = (orbit volume) × ∫_S (FP det)(·)`, the FP determinant appears as the Jacobian
-  of the gauge condition. Same answer, more roundabout; the FP det is implicitly
-  "full-`G` (degenerate) → section-`G` (full-rank)", which the direct route never forms.
+Two routes reach the **same** measure on `M`. The **factor-out** route (Faddeev & Popov,
+*Phys. Lett. B* **25** (1967) 29–30) starts from the full-`θ` integral,
+`∫_Θ = (orbit volume) × ∫_S (FP det)(·)`, and carries a Faddeev–Popov determinant for the
+gauge condition. The **direct** route (what we implement) never forms that integral: it
+parametrizes `M` straight from the section `S` and reads the target off the area formula,
+`p(π) · √det G_S`, with `G_S` full-rank (the `r²` kernel directions are gone). The FP
+determinant is not a *separate* object — it is constant for the hard gauge and already inside
+`√det G_S` for the balanced gauge. We are free to chart the base directly (unlike a field
+theory, whose field lives in the redundant space), so we take the direct route.
 
 So in code: **gauge fix = sample on the section + evaluate `½ log det G_S`. One determinant.**
 
