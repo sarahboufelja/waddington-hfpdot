@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import partial
 import logging
 import os
 
@@ -12,7 +13,7 @@ from jax import Array
 import jax.numpy as jnp
 from jax.experimental import mesh_utils
 from typing import Tuple, Literal
-from supports import make_support, LogProbFn, ScoreFn
+from supports import make_support, WhitenedSupport, LogProbFn, ScoreFn
 from mcmc_diagnostics import DiagnosticsSummary, MCMCDiagnostics
 
 # Set up the XLA flag to use jax.pmap on CPU
@@ -39,6 +40,22 @@ class FinalMalaState:
     diagnostics: DiagnosticsSummary
     mh_log_ratios: Array
 
+# Registered as a pytree so it can be the carry of jax.lax.scan / vmap (all fields are
+# dynamic arrays -> data_fields; no static metadata).
+@partial(jax.tree_util.register_dataclass,
+         data_fields=["state", "counter", "rng_keys", "step_size",
+                      "num_accepted_samples", "avg_mh_ratio"],
+         meta_fields=[])
+@dataclass
+class MALAState:
+    """Holds the intermediate state of the MALA sampler while running inference_loop."""
+    state: Array
+    counter: Array
+    rng_keys: Array
+    step_size: Array
+    num_accepted_samples: Array
+    avg_mh_ratio: Array
+
 class MetropolisAdjustedLangevinSampler:
     """
     Implements the Metropolis-Adjusted Langevin Algorithm (MALA) transition kernel for MCMC sampling in very high-dimensional
@@ -55,7 +72,7 @@ class MetropolisAdjustedLangevinSampler:
         radial_score_fn: ScoreFn | None = None,
         alpha: float| None = 0.5,
         shape: int = 10,
-        sampling_strategy: Literal["low_rank", "full_rank"] = "full_rank",
+        sampling_strategy: Literal["low_rank", "low_rank_section", "full_rank"] = "full_rank",
         support: Literal["simplex", "positive_orthant", "unconstrained"] = "unconstrained",
         num_samples: int = 8_000,
         num_burnin: int = 8_000,
@@ -65,6 +82,8 @@ class MetropolisAdjustedLangevinSampler:
         seed: int = 0,
         initial_plan: Array | None = None,
         warm_start_sigma: tuple[float, float] = (0.1, 0.3),
+        precondition: Literal["mode_hessian"] | None = None,
+        precond_floor: float = 1e-3,
         **kwargs,
     ):
         """Initializes the MetropolisAdjustedLangevinSampler transition kernel.
@@ -100,9 +119,10 @@ class MetropolisAdjustedLangevinSampler:
         self.alpha = alpha ## smoothing factor of the exponential moving average
         self.num_samples = num_samples
         self.tot_num_samples = self.num_samples + self.num_burnin
+        self.rank = kwargs.get("rank", None)
 
         # If support low_rank, make the II, JJ, rank and cost required
-        if sampling_strategy == "low_rank":
+        if sampling_strategy in ("low_rank", "low_rank_section"):
             if "II" not in kwargs or "JJ" not in kwargs or "rank" not in kwargs or "cost" not in kwargs:
                 raise ValueError("For low_rank support, II, JJ, rank and cost must be provided as keyword arguments.")
             if kwargs["II"] <= 0 or kwargs["JJ"] <= 0 or kwargs["rank"] <= 0:
@@ -119,11 +139,28 @@ class MetropolisAdjustedLangevinSampler:
             radial_score_fn=radial_score_fn,
             II=kwargs.get("II", None),
             JJ=kwargs.get("JJ", None),
-            rank=kwargs.get("rank", None),
+            rank=self.rank,
             cost=kwargs.get("cost", None),
             epsilon=kwargs.get("epsilon", None),
             ridge=kwargs.get("ridge", 0.0),
         )
+
+        # Low-rank supports define their own free-coordinate count m (r(II+JJ), or
+        # r(II+JJ)-r**2 for the hard-gauge section); use it so the caller need not pass it.
+        if hasattr(self.support, "num_free"):
+            self.shape = self.support.num_free
+
+        # Optional constant dense preconditioner: whiten by the mode-Hessian metric,
+        # M = [-d^2 log q(theta*)]^{-1} (experiment 1). Wraps the support so the sampler runs
+        # isotropically in whitened coords; needs a warm-start mode to evaluate the Hessian.
+        if precondition == "mode_hessian":
+            if self.initial_plan is None:
+                raise ValueError("precondition='mode_hessian' requires an initial_plan (the mode).")
+            inner = self.support
+            theta_star = inner.to_unconstrained(self.initial_plan.reshape(1, -1)).reshape(self.shape)
+            neg_logq = lambda t: -jnp.sum(inner.latent_log_prob(self.target_log_prob_function, t))
+            H = jax.hessian(neg_logq)(theta_star)
+            self.support = WhitenedSupport.from_mode_hessian(inner, H, floor=precond_floor)
 
         self.latent_log_prob_function = lambda x: self.support.latent_log_prob(self.target_log_prob_function, x)
         self.latent_score_function = lambda x: self.support.latent_score(self.target_score_function, x)
@@ -210,8 +247,8 @@ class MetropolisAdjustedLangevinSampler:
 
         # * Second stage is the main sampling stage with Robbins-Monro step size adaptation, using the estimated mass matrix.
         # * Continue from the warm-up's final state and step size to ensure continuity between the two stages.
-        # * carry layout: (state, counter, key, step_size, num_accepted, avg_mh_ratio); we reuse state[0] and step_size[3].
-        main_init_params = (warm_carry_state[0], warm_carry_state[3])
+        # * Reuse the warm-up's final state and step size (MALAState is a registered pytree).
+        main_init_params = (warm_carry_state.state, warm_carry_state.step_size)
         sharded_params = jax.device_put(main_init_params, SHARDING)
         self.init_key, sub_key = jax.random.split(self.init_key)
         sharded_keys = jax.random.split(sub_key, self.parallel_chains)
@@ -227,7 +264,14 @@ class MetropolisAdjustedLangevinSampler:
         
         return pmap_states, pmap_num_accepted_samps, pmap_mh_ratio
 
-    def preconditioned_langevin_update(self, curr_pos, grad, step_size, mass_diag, key):
+    def preconditioned_langevin_update(self, curr_pos, grad, step_size, mass_diag, key, support_name):
+        """
+        Performs a preconditioned Langevin update step, which is a combination of a gradient ascent step and a Gaussian noise term."""
+
+        if self.support.name == "low_rank":
+            # For low-rank support, we use the support's custom Langevin update.
+            return self.support.propose_gauge_constrained_step(curr_pos, step_size)
+
         z = jax.random.normal(key, shape=(1, self.shape))
         step = step_size * mass_diag * grad
         noise = jnp.sqrt(2 * step_size * mass_diag) * z
@@ -241,35 +285,35 @@ class MetropolisAdjustedLangevinSampler:
         init_keys: Array,
         warm_up: bool = True,
         mass_diag: Array = None,
-    ) -> tuple:
+    ) -> Tuple:
         """
         Runs the inference loop of the Metropolis-Adjusted Langevin Algorithm (MALA) transition kernel.
 
         Args:
             num_steps (int): the number of steps to run the inference loop.
-            init_params (Array): the initial parameters for the inference loop, including the initial state and step size.
+            init_params (Tuple[Array, Array]): the initial parameters for the inference loop, including the initial state and step size.
             init_keys (Array): the initial random keys for the inference loop.
             warm_up (bool, optional): whether to perform the warm-up phase. Defaults to True.
             mass_diag (Array, optional): the diagonal of the mass matrix. Defaults to None.
         
         """
 
-        def langevin_step(current_state: tuple, _):
+        def langevin_step(current_state: MALAState, _):
             """Runs one step of Langevin Monte Carlo with a Metropolis-Hastings (MH) correction step.
 
             Args:
-                current_x (Array): the current position.
+                current_x (MALAState): the current position.
 
             Returns:
                 Array: the next position.
             """
             nonlocal mass_diag
-            current_x = current_state[0]
-            current_ct = current_state[1]
-            key = current_state[2]
-            step_size = current_state[3]
-            num_accepted_samples = current_state[4]
-            avg_mh_ratio = current_state[5]
+            current_x = current_state.state
+            current_ct = current_state.counter
+            key = current_state.rng_keys
+            step_size = current_state.step_size
+            num_accepted_samples = current_state.num_accepted_samples
+            avg_mh_ratio = current_state.avg_mh_ratio
             current_ct += 1
             key, sub_key = jax.random.split(key)
 
@@ -279,25 +323,8 @@ class MetropolisAdjustedLangevinSampler:
 
             # Propose a new sample
             mass_diag = mass_diag if not warm_up else jnp.ones_like(current_x)
-            proposed_x = self.preconditioned_langevin_update(current_x, current_grad, step_size, mass_diag, sub_key)
 
-            # MH log-ratio
-            mh_log_ratio = (
-                self.latent_log_prob_function(proposed_x)
-                + self.log_proposal_dist(x=current_x,
-                                         y=proposed_x,
-                                         curr_step_size=step_size,
-                                         mass_diag=mass_diag)
-                - self.latent_log_prob_function(current_x)
-                - self.log_proposal_dist(x=proposed_x,
-                                         y=current_x,
-                                         curr_step_size=step_size,
-                                         mass_diag=mass_diag)
-            )
-            mh_log_ratio = jnp.where(jnp.isfinite(mh_log_ratio), mh_log_ratio, -jnp.inf)
-            metrop_hastings_ratio = jnp.exp(mh_log_ratio)
-            metrop_hastings_ratio = jnp.where(metrop_hastings_ratio <= 1, metrop_hastings_ratio, 1)
-            metrop_hastings_ratio = jnp.squeeze(metrop_hastings_ratio)
+            proposed_x, metrop_hastings_ratio = self.compute_metropolis_hastings_ratio(current_x, current_grad, step_size, mass_diag, sub_key)
 
             # MH Adjustment
             key, sub_key = jax.random.split(key)
@@ -327,8 +354,15 @@ class MetropolisAdjustedLangevinSampler:
             step_size = jnp.float32(step_size)
             # jax.debug.print("Current step size: {x}", x=step_size)
 
-            return (state, current_ct, key, step_size, num_accepted_samples, avg_mh_ratio), (state, num_accepted_samples, avg_mh_ratio)
+            carry_state = MALAState(state=state,
+                                    counter=current_ct,
+                                    rng_keys=key,
+                                    step_size=step_size,
+                                    num_accepted_samples=num_accepted_samples,
+                                    avg_mh_ratio=avg_mh_ratio)
 
+            return carry_state, (state, num_accepted_samples, avg_mh_ratio)
+    
         initial_ct = 0
         avg_mh_ratio = jnp.expand_dims(jnp.float32(0.), axis=0)
         num_accepted_samples = jnp.expand_dims(jnp.int32(0), axis=0)
@@ -337,16 +371,50 @@ class MetropolisAdjustedLangevinSampler:
     
         # First stage warm-up without step size adaptation for diag. mass matrix estimation.
         # During this stage, the step size is kept fixed.
-        carry_state, (states, num_accepted_samples, avg_mh_ratios) = jax.lax.scan(langevin_step, (initial_state,
-                                                                                                  initial_ct,
-                                                                                                  init_keys,
-                                                                                                  initial_step_size,
-                                                                                                  num_accepted_samples,
-                                                                                                  avg_mh_ratio),
-                                                                                                    None,
-                                                                                                    num_steps)
+        init_mala_state = MALAState(state=initial_state,
+                                    counter=initial_ct,
+                                    rng_keys=init_keys,
+                                    step_size=initial_step_size,
+                                    num_accepted_samples=num_accepted_samples,
+                                    avg_mh_ratio=avg_mh_ratio)
+        carry_state, (stacked_states, stacked_num_accepted_samples, stacked_avg_mh_ratios) = jax.lax.scan(langevin_step, init_mala_state, None, num_steps)
 
-        return states, num_accepted_samples, avg_mh_ratios, carry_state
+        return stacked_states, stacked_num_accepted_samples, stacked_avg_mh_ratios, carry_state
+    
+    def compute_metropolis_hastings_ratio(self, current_x: Array, current_grad: Array, step_size: float, mass_diag: Array, sub_key: Array) -> Tuple:
+
+        if self.support.name != "low_rank":
+            proposed_x = self.preconditioned_langevin_update(current_x, current_grad, step_size, mass_diag, sub_key, self.support.name)
+            log_prop_dist_forward =  self.log_proposal_dist(x=current_x,
+                                         y=proposed_x,
+                                         curr_step_size=step_size,
+                                         mass_diag=mass_diag)
+            log_prop_dist_backward = self.log_proposal_dist(x=proposed_x,
+                                            y=current_x,
+                                            curr_step_size=step_size,
+                                            mass_diag=mass_diag)
+        
+        else:
+            proposed_x_summary = self.support.propose_bal_gauge_constrained_step(current_x, step_size)
+            log_prop_dist_forward = self.support.evaluate_bal_gauge_log_proposal_density(proposed_x_summary)
+            backward_noise, backward_velocity = self.support.invert_retraction(proposed_x_summary.state, current_x)
+            log_prop_dist_backward = self.support.evaluate_bal_gauge_log_proposal_density(self.support.StateSummary(state=current_x,
+                                                                                                                    matching_noise=backward_noise,
+                                                                                                                    velocities=backward_velocity))
+
+        # MH log-ratio
+        mh_log_ratio = (
+                self.latent_log_prob_function(proposed_x)
+                + log_prop_dist_forward
+                - self.latent_log_prob_function(current_x)
+                - log_prop_dist_backward
+            )
+        mh_log_ratio = jnp.where(jnp.isfinite(mh_log_ratio), mh_log_ratio, -jnp.inf)
+        metrop_hastings_ratio = jnp.exp(mh_log_ratio)
+        metrop_hastings_ratio = jnp.where(metrop_hastings_ratio <= 1, metrop_hastings_ratio, 1)
+        metrop_hastings_ratio = jnp.squeeze(metrop_hastings_ratio)
+
+        return proposed_x, metrop_hastings_ratio
 
     def log_proposal_dist(self, x: Array, y: Array, curr_step_size: float, mass_diag: Array) -> float:
         r"""Computes the log transition probability density function at x given y:
@@ -361,8 +429,12 @@ class MetropolisAdjustedLangevinSampler:
             _type_: _description_
         """
         logger.info("Computing the log transition kernel")
+        if self.support.name == "low_rank":
+            return self.support.evaluate_bal_gauge_log_proposal_density(x, curr_step_size)
+
         diff = x - y - curr_step_size * mass_diag * self.latent_score_function(y)
         return - 0.5 * jnp.sum(jnp.square(diff) / (2 * curr_step_size * mass_diag))
+
 
 class HFPDOTHyperprior:
     def __init__(
