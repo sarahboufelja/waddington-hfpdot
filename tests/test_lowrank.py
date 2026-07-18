@@ -3,7 +3,7 @@
 Covers, in order:
   group 1 - the (U, V) coordinates: pack/unpack round-trip, batch-awareness, num_free,
   group 2 - reconstruction: to_constrained batches, and the simplex normalizes globally,
-  group 3 - the balanced gauge_fix and GL(r) gauge invariance of the plan,
+  group 3 - GL(r) gauge invariance of the plan,
   group 4 - the warm start: to_unconstrained -> to_constrained round-trip (+ batched),
   group 5 - the analytic latent_score against jax.grad (orthant, simplex, higher rank, ridge).
 
@@ -89,17 +89,6 @@ def test_simplex_is_globally_normalized():
 # =========================================================================== #
 # group 3 - gauge
 # =========================================================================== #
-def test_gauge_fix_balances_and_preserves_plan():
-    lr = _lr()
-    U = jax.random.normal(jax.random.key(5), (lr.II, lr.rank))
-    V = jax.random.normal(jax.random.key(6), (lr.JJ, lr.rank))
-    Ug, Vg = lr.gauge_fix(U, V)
-    UtU, VtV = Ug.T @ Ug, Vg.T @ Vg
-    assert jnp.allclose(UtU, VtV, atol=1e-8)                              # balanced
-    assert jnp.allclose(UtU - jnp.diag(jnp.diag(UtU)), 0.0, atol=1e-8)    # diagonal
-    assert jnp.allclose(_plan_of(lr, Ug, Vg), _plan_of(lr, U, V), atol=1e-8)  # gauge-invariant
-
-
 def test_gl_r_orbit_leaves_plan_invariant():
     lr = _lr()
     U = jax.random.normal(jax.random.key(7), (lr.II, lr.rank))

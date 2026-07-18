@@ -33,29 +33,6 @@ import jax.scipy.stats as jstats
 LogProbFn = Callable[[Array], Array]
 ScoreFn = Callable[[Array], Array]
 
-@dataclass
-class NoiseMatrices:
-    A_noise_U: Array
-    A_noise_V: Array
-    S_noise: Array
-
-@dataclass
-class BalancedGaugeDrift:
-    shared_symmetric_part: Array
-    assymetric_u: Array
-    assymetric_v: Array
-    
-@dataclass
-class StateSummary:
-    """
-    Summary of a proposed state in the balanced gauge constraint manifold.
-    Returns the proposed state, the noise matrices that gave rise to the proposal, and the velocities used in the retraction step.
-    """
-    state: Array
-    balanced_gauge_drift: Optional[BalancedGaugeDrift] = None
-    matching_noise: Optional[NoiseMatrices] = None
-    velocities: Optional[Array] = None
-
 class Support(ABC):
     """Abstract base class for a constrained-support reparametrization.
 
@@ -280,8 +257,9 @@ class LowRank(Support):
         self.log_K = -jnp.asarray(cost).reshape(II, JJ) / epsilon  # fixed -C/eps offset
 
         # Fully-free coordinates: U (II, r) then V (JJ, r), m = r(II+JJ). The r**2 GL(r)
-        # gauge directions are flat for log p(pi(theta)) (assess convergence on pi, not theta);
-        # gauge_fix is the balanced (U^T U = V^T V) canonicalizer used only at warm-start time.
+        # gauge directions are flat for log p(pi(theta)) -- assess convergence on pi, not theta.
+        # The gauge is broken (softly) by the ridge above, NOT fixed; a hard gauge fix lives in
+        # LowRankSection, and the correct manifold treatment is Option C (docs/option_c_proposal.md).
         self._n_u = self.II * self.rank
         self.num_free = self._n_u + self.JJ * self.rank
 
@@ -321,161 +299,6 @@ class LowRank(Support):
         y = y.reshape(*y.shape[:-2], self.II * self.JJ)      # (..., II*JJ)
         return self.support.to_constrained(y)                # exp / global softmax on the last axis
     
-    @staticmethod
-    def _generate_skew_symmetric(r):
-        z = jnp.random.randn(r, r)
-        return LowRank._extract_skew_symmetric_part(z)
-        
-    @staticmethod
-    def _generate_symmetric(r):
-        z = jnp.random.randn(r, r)
-        return LowRank._extract_symmetric_part(z)
-    
-    @staticmethod
-    def _extract_symmetric_part(matrix):
-        return 0.5 * (matrix + matrix.T)
-    
-    @staticmethod
-    def _extract_skew_symmetric_part(matrix):
-        return 0.5 * (matrix - matrix.T)
-        
-    def compute_bal_gauge_proposal_drift(self, theta, sigma_eq) -> BalancedGaugeDrift:
-        """
-        In the balanced gauge constraint, the energy is split equally between U and V and is diagonal.
-        Returns the symmetric and skew symmetric parts of the proposal -- tightly locked into the manifold.
-        Accepted or rejected by the MH correction step.
-        """
-
-        U, V = self.unpack(theta)
-        score_func = self.latent_score_function(theta)
-    
-        # Compute the unrestricted gradients.
-        G_U, G_V = self.unpack(score_func)
-
-        # First project the gradients into the internal space: `U.T @ G_U` and `V.T @ G_V`, and then compute their skew symmetric part
-        A_U = 0.5 * (U.T @ G_U - G_U.T @ U)
-        A_V = 0.5 * (V.T @ G_V - G_V.T @ V)
-
-        # Compute the symmetric part. Since S_U = S_V = S_shared, we satisfy the balanced gauge constraint.
-        S_U = 0.5 * (U.T @ G_U + G_U.T @ U)
-        S_V = 0.5 * (V.T @ G_V + G_V.T @ V)
-        S_shared = 0.25 * (S_U + S_V) / sigma_eq
-
-        return BalancedGaugeDrift(
-            shared_symmetric_part=S_shared,
-            assymetric_u=A_U,
-            assymetric_v=A_V
-        )
-
-    def propose_bal_gauge_constrained_step(self, theta, epsilon) -> StateSummary:
-        """
-        Propose a new state in the balanced gauge constraint manifold.
-        Returns the proposed state and the noise matrices A_noise_U, A_noise_V, S_noise that gave rise to the proposal.
-        These are used in the MH correction step."""
-        
-        # Compute the symmetric and skew symmetric parts of the drift in the proposed state
-        balanced_gauge_drift = self.compute_bal_gauge_proposal_drift(theta, sigma_eq=1.0)
-
-        # Geometry-matched noise
-        A_noise_U = LowRank._generate_skew_symmetric(self.rank)
-        A_noise_V = LowRank._generate_skew_symmetric(self.rank)
-        S_noise = LowRank._generate_symmetric(self.rank)
-
-        # Total velocity matrices, confined now to the rigid tangent space of the balanced gauge.
-        Omega_U = (epsilon**2 / 2.0) * (balanced_gauge_drift.assymetric_u + balanced_gauge_drift.shared_symmetric_part) + epsilon * (A_noise_U + S_noise)
-        Omega_V = (epsilon**2 / 2.0) * (balanced_gauge_drift.assymetric_v + balanced_gauge_drift.shared_symmetric_part) + epsilon * (A_noise_V + S_noise)
-        Omega = self.support.pack(Omega_U, Omega_V)
-
-        # Retract onto the manifold using the exponential matrix operator
-        U, V = self.unpack(theta)
-        U_prop = U @ jax.scipy.linalg.expm(Omega_U)
-        V_prop = V @ jax.scipy.linalg.expm(Omega_V)
-
-        theta_prop = self.support.pack(U_prop, V_prop)
-
-        return StateSummary(
-            state=theta_prop,
-            balanced_gauge_drift=balanced_gauge_drift,
-            matching_noise=NoiseMatrices(A_noise_U=A_noise_U,
-                                         A_noise_V=A_noise_V,
-                                         S_noise=S_noise),
-            velocities=Omega
-        )
-    
-    def invert_retraction(self, proposed_theta, curr_theta: Array) -> Tuple[NoiseMatrices, Array]:
-        """
-        Invert the retraction step to compute the backward noise matrices that would have produced the current state from the proposed state.
-        """
-        balanced_gauge_drift_back = self.compute_bal_gauge_proposal_drift(proposed_theta, sigma_eq=1.0)
-        
-        # Invert the retraction via a matrix log.
-        U_prop, V_prop = self.unpack(proposed_theta)
-        U_original, V_original = self.unpack(curr_theta)
-        omega_u_back = jax.scipy.linalg.logm(jnp.linalg.inv(U_prop) @ U_original)
-        omega_v_back = jax.scipy.linalg.logm(jnp.linalg.inv(V_prop) @ V_original)
-        omega_back = self.pack(omega_u_back, omega_v_back)
-
-        # Extract the noise matrices from the velocities.
-        S_noise_back = LowRank._extract_symmetric_part(omega_u_back) - balanced_gauge_drift_back.shared_symmetric_part
-        A_noise_U_back = LowRank._extract_skew_symmetric_part(omega_u_back) - balanced_gauge_drift_back.assymetric_u
-        A_noise_V_back = LowRank._extract_skew_symmetric_part(omega_v_back) - balanced_gauge_drift_back.assymetric_v
-
-        return NoiseMatrices(A_noise_U=A_noise_U_back, A_noise_V=A_noise_V_back, S_noise=S_noise_back), omega_back
-    
-    def evaluate_noise_log_density(self, noise_matrices: NoiseMatrices) -> float:
-        """
-        Evaluates the log proposal density of the noise matrices under the standard Gaussian distribution."""
-        pass
-
-    def compute_det_exp_mat_jacobian(self, velocity: Array) -> float:
-        """
-        Compute the determinant of the Jacobian of the matrix exponential map at a given matrix \Omega.
-        The Jacobian of the matrix exponential is governed by the operator: \frac{1-exp(-ad_{\Omega})}{ad_{\Omega}}
-        where ad_{\Omega}(X) = [\Omega, X] is the adjoint operator or equivalently, the Lie bracket.
-        The determinant of this operator can be computed using the eigenvalues of the adjoint operator.
-        More precisely, the differences between those eigenvalues \((\mu_i - \mu_j)\) tell you exactly how much space is stretched.
-
-        Args:
-            velocity (Array): The velocity at which to compute the Jacobian determinant.
-        Returns:
-            float: The log determinant of the Jacobian of the matrix exponential at the given velocity.
-        """
-        # First, compute the eignevalues of the velocity
-        eigenvalues = jnp.linalg.eigvals(velocity)
-        # Because the velocity is not necessarily symmetric, ethe eignevalues may be complex. Take the abs:
-        eigenvalues = jnp.abs(eigenvalues)
-
-        # Compute the pairwise differences -- the eigenvalues of the adjoint operator.
-        # We construct an rxr matrix where each entry (i, j) is the difference between the i-th and j-th eigenvalue.
-        pairwise_differences = eigenvalues[:, None] - eigenvalues[None, :]
-
-        # Stabilize computation
-        abs_small = jnp.abs(pairwise_differences) < 1e-6
-        abs_large = ~ abs_small
-
-        eval_func_values = jnp.zeros_like(pairwise_differences, dtype=jnp.float64)
-
-        large_diffs = pairwise_differences[abs_large]
-        numerator = 1.0 - jnp.exp(-large_diffs)
-        adj_eigenvalues = jnp.log(numerator / large_diffs)
-        eval_func_values[abs_large] = adj_eigenvalues
-
-        # For small differences -- identical or close eignevalues, we use a Taylor expansion to avoid numerical instability.
-        small_diffs = pairwise_differences[abs_small]
-        # taylor expansion of log(1 - exp(-x)) / x around x=0 is 1 - x/2 + x^2/6 - x^3/24 + ...
-        taylor_expansion = 1 - small_diffs/2 + (small_diffs**2)/6 - (small_diffs**3)/24
-        eval_func_values[abs_small] = taylor_expansion
-        return jnp.sum(eval_func_values)
-
-
-    def evaluate_bal_gauge_log_proposal_density(self, proposed_state: StateSummary,) -> float:
-        """
-        Evaluate the log proposal density of the proposed state given the noise matrices.
-        This includes the log density of the noise matrices and the Jacobian determinant of the retraction step.
-        """
-        log_density = self.evaluate_noise_log_density(proposed_state.matching_noise) + self.compute_det_exp_mat_jacobian(proposed_state.velocities)
-        return log_density
-        
     def to_unconstrained(self, pi: Array) -> Array:
         r"""Warm start: a plan ``pi`` -> free vector via best rank-``r`` log-factorization.
 
@@ -488,7 +311,12 @@ class LowRank(Support):
         """
         pi = jnp.asarray(pi)
         pi_mat = pi.reshape(*pi.shape[:-1], self.II, self.JJ)     # (..., II, JJ)
-        L = jnp.log(jnp.clip(pi_mat, 1e-300, None)) - self.log_K  # = log pi + C/eps, (..., II, JJ)
+        # Floor must be DTYPE-AWARE: a hardcoded 1e-300 is below float32's smallest subnormal, so
+        # it underflows to 0.0 and the clip becomes a NO-OP -- exact zeros (which Sinkhorn does
+        # produce at large N / small eps) then give log(0) = -inf, and the SVD below returns NaN
+        # (LAPACK SLASCL error). finfo(...).tiny keeps log finite (~-87 in float32).
+        tiny = jnp.finfo(pi_mat.dtype).tiny
+        L = jnp.log(jnp.clip(pi_mat, tiny, None)) - self.log_K    # = log pi + C/eps, (..., II, JJ)
         Us, s, Vt = jnp.linalg.svd(L, full_matrices=False)        # (..., II, K), (..., K), (..., K, JJ)
         sr = jnp.sqrt(s[..., : self.rank])[..., None, :]          # (..., 1, r) -> broadcasts over rows
         U = Us[..., :, : self.rank] * sr                          # (..., II, r): first r columns of Us
@@ -501,8 +329,9 @@ class LowRank(Support):
         pi = self.to_constrained(theta).reshape(1, self.II * self.JJ)
         return target_log_prob_fn(pi) - self.ridge * jnp.sum(theta ** 2)
 
-    def latent_score(self, target_score_fn: ScoreFn, theta: Array, with_ridge: bool = False) -> Array:
-        """Exact chain rule of ``log p(pi(theta))`` through ``pi = to_constrained(U V^T - C/eps)``.
+    def latent_score(self, target_score_fn: ScoreFn, theta: Array) -> Array:
+        """Exact chain rule of ``log p(pi(theta))`` through ``pi = to_constrained(U V^T - C/eps)``,
+        **plus the ridge gradient** -- this is contractually ``grad(latent_log_prob)``.
 
         Called per-state (the sampler vmaps over chains); ``target_score_fn`` is single-state,
         so this is not vectorized over a ``(C, N)`` batch, but the einsums are ``...``-shaped.
@@ -519,10 +348,11 @@ class LowRank(Support):
         grad_U = jnp.einsum("...ij,...jr->...ir", M, V)              # d log p / d U = M V
         grad_V = jnp.einsum("...ij,...ir->...jr", M, U)              # d log p / d V = M^T U
         grad = self.pack(grad_U, grad_V).reshape(orig_shape)
-        
-        if with_ridge:
-            grad = grad - 2.0 * self.ridge * theta                       # + gradient of -ridge*||theta||^2
-        return grad
+        # The ridge is ALWAYS in latent_log_prob, so its gradient must ALWAYS be here -- the module
+        # contract is latent_score == grad(latent_log_prob). The old `with_ridge=False` default
+        # silently broke it: the sampler calls latent_score(fn, x), so the MALA drift ignored the
+        # very term meant to pin the runaway simplex softmax-shift gauge. (No-op when ridge=0.)
+        return grad - 2.0 * self.ridge * theta                          # grad of -ridge*||theta||^2
 
 
 class LowRankSection(LowRank):
@@ -621,7 +451,9 @@ class LowRankSection(LowRank):
         the gauge move ``R = U_top^{-1}`` sends ``U_top -> I_r`` (``V -> V U_top^T`` keeps
         ``U V^T``). Single-plan (called once), not batched."""
         pi = jnp.asarray(pi).reshape(-1)
-        L = jnp.log(jnp.clip(pi.reshape(self.II, self.JJ), 1e-300, None)) - self.log_K
+        pi_mat = pi.reshape(self.II, self.JJ)
+        tiny = jnp.finfo(pi_mat.dtype).tiny   # dtype-aware floor; see LowRank.to_unconstrained
+        L = jnp.log(jnp.clip(pi_mat, tiny, None)) - self.log_K
         Us, s, Vt = jnp.linalg.svd(L, full_matrices=False)
         sr = jnp.sqrt(s[: self.rank])[None, :]                 # (1, r)
         U = Us[:, : self.rank] * sr                            # (II, r)

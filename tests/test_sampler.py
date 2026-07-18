@@ -88,7 +88,7 @@ def _build_sampler(**overrides):
 def test_sampler_recovers_correlated_gaussian_moments():
     sampler, mu, sigma = _build_sampler()
     state = sampler.sample(with_diagnostics=False)
-    num_accepted = state.num_accepted_samples
+    num_accepted = state.stacked_mala_states.stacked_num_accepted_samples  # (C, tot_steps, 1), cumulative
     samples = state.samples.reshape(-1, state.samples.shape[-1])  # (C, N, d) -> (C*N, d)
 
     est_mean = jnp.mean(samples, axis=0)

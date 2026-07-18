@@ -36,16 +36,11 @@ class DiagnosticsSummary:
 
 class MCMCDiagnostics:
     """Convergence diagnostics over ``(num_chains, num_draws, dim)`` draws.
-
-    Args:
-        log_prob_fn: maps a single latent state ``(dim,)`` to a scalar log-density.
-            Required only for :meth:`ebfmi`.
     """
 
-    def __init__(self,  log_prob_fn: Callable[[Array], Array], constrained_chains: Array, latent_chains: Array | None = None,):
-        self.log_prob_fn = log_prob_fn
+    def __init__(self, constrained_chains: Array, latent_log_prob_states: Array | None = None,):
         self.constrained_chains = constrained_chains
-        self.latent_chains = latent_chains if latent_chains is not None else constrained_chains # If no latent chains are provided, assume the constrained chains are the latent chains (e.g., for pi-space diagnostics).
+        self.latent_log_prob_states = latent_log_prob_states
 
     # --------------------------------------------------------------------- #
     # Rank-normalized split-R-hat (Vehtari et al. 2021).
@@ -141,17 +136,13 @@ class MCMCDiagnostics:
     # --------------------------------------------------------------------- #
     # Energy-based fraction of missing information (per chain).
     # --------------------------------------------------------------------- #
-    def ebfmi(self, chains: Array) -> Array:
+    def ebfmi(self, latent_log_prob_states: Array) -> Array:
         """eBFMI per chain on the energy E = -log_prob. (C, N, D) -> (C,).
 
         Differences are taken *within* each chain (the previous implementation
         differenced a flattened array, mixing chains).
         """
-        if self.log_prob_fn is None:
-            raise ValueError("ebfmi requires a log_prob_fn at construction.")
-        C, N = chains.shape[0], chains.shape[1]
-        energies = -jax.vmap(jax.vmap(self.log_prob_fn))(chains)
-        energies = energies.reshape(C, N)                        # robust to scalar/(1,) returns
+        energies = -latent_log_prob_states  # (C, N)
         diffs = jnp.diff(energies, axis=1)
         numerator = jnp.mean(diffs ** 2, axis=1)
         denominator = jnp.var(energies, axis=1)
@@ -175,6 +166,6 @@ class MCMCDiagnostics:
             "ess": ess,
             "ess_min": jnp.min(ess),
         }
-        ebfmi = self.ebfmi(self.latent_chains) 
+        ebfmi = self.ebfmi(self.latent_log_prob_states) 
         out |= {"ebfmi": ebfmi, "ebfmi_min": jnp.min(ebfmi)}
         return DiagnosticsSummary(**out)

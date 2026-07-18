@@ -12,7 +12,7 @@ from datetime import date
 from jax import Array
 import jax.numpy as jnp
 from jax.experimental import mesh_utils
-from typing import Tuple, Literal
+from typing import Dict, Sequence, Tuple, Literal
 from supports import make_support, WhitenedSupport, LogProbFn, ScoreFn
 from mcmc_diagnostics import DiagnosticsSummary, MCMCDiagnostics
 
@@ -32,29 +32,71 @@ logger.setLevel(logging.DEBUG)
 logger.info(f"Number of devices: {jax.local_devices()}")
 TARGET_ACCEPT = 0.574
 
-@dataclass
-class FinalMalaState:
-    """Holds the final state of the MALA sampler after running inference_loop."""
-    samples: Array
-    num_accepted_samples: Array
-    diagnostics: DiagnosticsSummary
-    mh_log_ratios: Array
-
 # Registered as a pytree so it can be the carry of jax.lax.scan / vmap (all fields are
 # dynamic arrays -> data_fields; no static metadata).
 @partial(jax.tree_util.register_dataclass,
          data_fields=["state", "counter", "rng_keys", "step_size",
-                      "num_accepted_samples", "avg_mh_ratio"],
+                      "num_accepted_samples", "avg_mh_ratio", "latent_log_prob_state"],
          meta_fields=[])
 @dataclass
 class MALAState:
-    """Holds the intermediate state of the MALA sampler while running inference_loop."""
+    """Holds the intermediate state of the MALA sampler while running `inference_loop`.
+
+    ``latent_log_prob_state`` is the log-density of the CURRENT (accepted) latent state --
+    carried through the scan so eBFMI can read it directly at diagnostics time instead of
+    re-evaluating log_prob on every draw (which materialises a full plan per draw -> OOM at
+    cell scale). All fields are dynamic arrays (data_fields); registration order MUST match
+    the field list below.
+    """
     state: Array
     counter: Array
     rng_keys: Array
     step_size: Array
     num_accepted_samples: Array
     avg_mh_ratio: Array
+    latent_log_prob_state: Array | None = None
+
+# Registered as a pytree so vmap/jit can return it (one instance whose fields carry a leading
+# chain axis -- NOT a list of per-chain instances). Access fields directly, e.g.
+# `stacked.stacked_latent_states` has shape (C, num_steps, ...); do NOT index `stacked[i]`.
+@partial(jax.tree_util.register_dataclass,
+         data_fields=["stacked_latent_states", "stacked_latent_log_prob_states",
+                      "stacked_num_accepted_samples", "stacked_avg_mh_ratios"],
+         meta_fields=[])
+@dataclass
+class StackedMALAStates:
+    r"""
+    Holds the stacked states of the MALA sampler after running `inference_loop`, for all steps and one chain.
+    """
+    stacked_latent_states: Array
+    stacked_latent_log_prob_states: Array
+    stacked_num_accepted_samples: Array
+    stacked_avg_mh_ratios: Array
+
+
+@dataclass
+class MalaChainSummary:
+    r"""Holds the summary states -- aggregated over all steps -- of the MALA sampler after running one chain of `inference_loop`.
+
+    ``latent_samples`` (the compact ``theta``, ~250x smaller than a plan) is the **manifest**: any
+    plan is rebuildable from it via ``support.to_constrained``. The full set of plans is not
+    storable at cell scale (10^6 plan x 5_000 draws x 4 chains = 80 GB > 52 GB).
+
+    ``samples`` are the plans ``pi`` -- but with ``sample(max_pi_coords=k)`` they are **per-parameter
+    thinned**: only a fixed random ``k``-coordinate subset is kept (``pi_coord_idx`` records which).
+    That subset is chosen ONCE and applied to every draw, so each retained coordinate keeps its
+    complete draw-trace and its R-hat/ESS are **exact and uncapped**.
+
+    NOTE: a per-parameter-thinned ``samples`` is for **diagnostics only** -- it cannot be
+    push-forwarded (``psi . pi_bar`` needs the whole ``II x JJ`` matrix). Downstream consumers must
+    rebuild the ``N`` whole plans they need from ``latent_samples`` and stream them.
+    """
+    samples: Array
+    diagnostics: DiagnosticsSummary | None = None
+    pi_coord_idx: Array | None = None     # set iff `samples` is a trimmed coordinate subset
+    config: Dict | None = None
+    stacked_mala_states: StackedMALAStates | None = None
+
 
 class MetropolisAdjustedLangevinSampler:
     """
@@ -167,32 +209,75 @@ class MetropolisAdjustedLangevinSampler:
 
     def sample(
         self,
-        with_diagnostics: bool = True,):
-        
-        # Sample with multiple chains and run diagnostics
-        samples, num_accepted_samples, mh_log_ratio = self.inference_loop_multiple_chains()
+        with_diagnostics: bool = True,
+        max_pi_coords: int | None = None,):
+        r"""Run the chains and summarise them.
 
-        # Remove the burn-in samples: (num_chains, num_kept, 1, sample_dim).
-        samples = samples[:, self.num_burnin:]
+        Args:
+            with_diagnostics: compute the R-hat / ESS / eBFMI summary.
+            max_pi_coords: **per-parameter thinning** -- keep only this many coordinates of ``pi``.
+                Leave ``None`` for small plans (full behaviour). Needed at cell scale: the chain
+                itself is compact (``theta``), but expanding every draw into a whole plan at once
+                costs ``chains x draws x II*JJ`` -- 80 GB for a 10^6 plan, 4 chains, 5000 draws.
+        """
+        # Sample all chains. `mix` is a SINGLE vmapped StackedMALAStates whose fields carry a
+        # leading chain axis -- access fields directly.
+        mix = self.inference_loop_multiple_chains()
 
-       # Drop the singleton dimension: (num_chains, num_kept, sample_dim).
-        latent_samples = jnp.squeeze(samples, axis=2)  # Shape = (C, D, m) where m = sample_dim
-        
-        constrained_samples = self.support.to_constrained(latent_samples)  # Shape = (C, D, m) where m = sample_dim
+        latent_samples = mix.stacked_latent_states                 # (C, tot_steps, 1, m)
+        latent_log_prob_states = mix.stacked_latent_log_prob_states  # (C, tot_steps, 1, 1)
+
+        # Drop burn-in + singleton axes. The energies are carried per step (the accepted state's
+        # log-prob, ALREADY computed for the MH ratio), so eBFMI reads them with ZERO extra compute
+        # and exactly for the states visited. NB: recomputing them is not inherently OOM -- each
+        # energy needs only one transient plan -- but the OLD diag path recomputed via vmap over
+        # ALL draws, materialising the (C, D, II*JJ) intermediate at once = 80 GB. The carry
+        # sidesteps both the recompute and that batching.
+        latent_samples = jnp.squeeze(latent_samples[:, self.num_burnin:], axis=2)   # (C, D, m)
+        C, D = latent_samples.shape[0], latent_samples.shape[1]
+        latent_log_prob_states = latent_log_prob_states[:, self.num_burnin:].reshape(C, D)  # (C, D)
+
+        pi_coord_idx = None
+        plan_dim = self.support.to_constrained(latent_samples[0, 0]).shape[-1]   # one plan only
+        if max_pi_coords is not None and plan_dim > max_pi_coords:
+            # PER-PARAMETER THINNING. The coordinate subset is drawn ONCE and closed over, so the
+            # SAME coordinates are kept in every draw. That fixedness is what makes it sound: each
+            # retained coordinate keeps its complete draw-trace, so its autocorrelation -- hence
+            # ESS_j and R-hat_j -- is EXACT and uncapped. (A fresh subset per draw would give
+            # ragged traces and meaningless ESS.) R-hat/ESS are per-coordinate statistics reported
+            # as min/median, so coordinates are interchangeable replicates.
+            #
+            # TODO(revisit): this diagnoses a SUBSET of the parameter space. If an EXHAUSTIVE
+            # per-parameter diagnostic (all II*JJ coordinates) is ever needed, switch axes: thin
+            # the DRAWS instead and keep whole plans (as Patterson & Teh, NIPS 2013, do with
+            # thin=100), accepting that ESS is then capped by the retained draw count.
+            pi_coord_idx = jax.random.choice(jax.random.key(self.seed + 7777), plan_dim,
+                                             shape=(max_pi_coords,), replace=False)
+            C, D, m = latent_samples.shape
+            # Flatten to (C*D, m) so lax.map iterates over INDIVIDUAL draws: only one whole plan
+            # (~4 MB) is live at a time, never the (C, D, II*JJ) block. It also makes the lambda
+            # receive a single state (m,), so `[pi_coord_idx]` indexes the COORDINATE axis -- on an
+            # unflattened (D, n) slice it would silently select draws instead.
+            constrained_samples = jax.lax.map(
+                lambda th: self.support.to_constrained(th)[pi_coord_idx],
+                latent_samples.reshape(-1, m),
+            ).reshape(C, D, max_pi_coords)
+        else:
+            constrained_samples = self.support.to_constrained(latent_samples)   # (C, D, II*JJ)
 
         # Compute diagnostic metrics in the transformed spaces (pi-space)
         # Convergence diagnostics operate on the latent sampling space, per chain.
         # eBFMI needs the log-prob, so we pass it to the diagnostics object; R-hat/ESS are gauge-invariant on pi, so we don't need a log-prob for that.
         self._diagnostics = MCMCDiagnostics(constrained_chains=constrained_samples,
-                                            latent_chains=latent_samples,
-                                            log_prob_fn=self.latent_log_prob_function)
+                                            latent_log_prob_states=latent_log_prob_states, # eBFMI needs the log-prob, so we pass it to the diagnostics object; R-hat/ESS are gauge-invariant on pi, so we don't need a log-prob for that.
+                                            )
         diag = self._diagnostics.summarize() if with_diagnostics else None
 
-        return FinalMalaState(
+        return MalaChainSummary(
             samples=constrained_samples,
-            num_accepted_samples=num_accepted_samples,
             diagnostics=diag,
-            mh_log_ratios=mh_log_ratio
+            pi_coord_idx=pi_coord_idx,
+            stacked_mala_states=mix,   # full archive (incl. burn-in): latent theta + acceptance counts
         )
 
     def initialize_diverse_chains(self, keys):
@@ -217,7 +302,7 @@ class MetropolisAdjustedLangevinSampler:
         indices = jnp.arange(self.parallel_chains)
         return jax.vmap(_one_chain)(keys, indices)
 
-    def inference_loop_multiple_chains(self):
+    def inference_loop_multiple_chains(self) -> Sequence[StackedMALAStates]:
         self.init_key, new_key = jax.random.split(self.init_key)
         sample_keys = jax.random.split(new_key, self.parallel_chains)
         # * Sharding the keys across devices to run the chains in parallel.
@@ -234,43 +319,40 @@ class MetropolisAdjustedLangevinSampler:
         sharded_params = jax.device_put(params_to_shard, SHARDING)
 
         # First stage is a warm-up stage without step adaptation.
-        (warm_pmap_states,
-        warm_pmap_num_accepted_samps,
-        warm_pmap_mh_ratio,
-        warm_carry_state) = jax.vmap(self.inference_loop, in_axes=(None, 0, 0, None))(self.warm_up_steps,
-                                                                                      sharded_params,
-                                                                                      sharded_keys,
-                                                                                      True)
+        (warm_carry_states,
+         warm_stacked_states) = jax.vmap(self.inference_loop, in_axes=(None, 0, 0, None))(self.warm_up_steps,
+                                                                                          sharded_params,
+                                                                                          sharded_keys,
+                                                                                          True)
         # * Compute the variance of each variable across all chains and all warm-up samples to estimate the diagonal
-        # * of the mass matrix.
-        mass_diag = jnp.var(warm_pmap_states, axis=(0, 1))
+        # * of the mass matrix. warm_stacked_states is a SINGLE vmapped StackedMALAStates whose fields
+        # * carry a leading chain axis -> (C, warm_steps, 1, m); average over chains and steps.
+        # TODO: confirm if the variance should be computed in the latent space versus the constrained space.
+        # The current implementation computes the variance in the latent space.
+        mass_diag = jnp.var(warm_stacked_states.stacked_latent_states, axis=(0, 1))
 
         # * Second stage is the main sampling stage with Robbins-Monro step size adaptation, using the estimated mass matrix.
         # * Continue from the warm-up's final state and step size to ensure continuity between the two stages.
-        # * Reuse the warm-up's final state and step size (MALAState is a registered pytree).
-        main_init_params = (warm_carry_state.state, warm_carry_state.step_size)
+        # * warm_carry_states is a SINGLE vmapped MALAState (fields batched over chains).
+        init_states = warm_carry_states.state             # (C, 1, m)
+        init_step_sizes = warm_carry_states.step_size     # (C, 1)
+        main_init_params = (init_states, init_step_sizes)
         sharded_params = jax.device_put(main_init_params, SHARDING)
         self.init_key, sub_key = jax.random.split(self.init_key)
         sharded_keys = jax.random.split(sub_key, self.parallel_chains)
         sharded_keys = jax.device_put(sharded_keys, SHARDING)
-        (pmap_states,
-         pmap_num_accepted_samps,
-         pmap_mh_ratio,
-         _) = jax.vmap(self.inference_loop, in_axes=(None, 0, 0, None, None))(self.tot_num_samples,
+        (_,
+         mix_stacked_states) = jax.vmap(self.inference_loop, in_axes=(None, 0, 0, None, None))(self.tot_num_samples,
                                                                              sharded_params,
                                                                              sharded_keys,
                                                                              False,
                                                                              mass_diag)
         
-        return pmap_states, pmap_num_accepted_samps, pmap_mh_ratio
+        return mix_stacked_states
 
-    def preconditioned_langevin_update(self, curr_pos, grad, step_size, mass_diag, key, support_name):
+    def preconditioned_langevin_update(self, curr_pos, grad, step_size, mass_diag, key):
         """
         Performs a preconditioned Langevin update step, which is a combination of a gradient ascent step and a Gaussian noise term."""
-
-        if self.support.name == "low_rank":
-            # For low-rank support, we use the support's custom Langevin update.
-            return self.support.propose_gauge_constrained_step(curr_pos, step_size)
 
         z = jax.random.normal(key, shape=(1, self.shape))
         step = step_size * mass_diag * grad
@@ -285,7 +367,7 @@ class MetropolisAdjustedLangevinSampler:
         init_keys: Array,
         warm_up: bool = True,
         mass_diag: Array = None,
-    ) -> Tuple:
+    ) -> Tuple[MALAState, StackedMALAStates]:
         """
         Runs the inference loop of the Metropolis-Adjusted Langevin Algorithm (MALA) transition kernel.
 
@@ -324,12 +406,13 @@ class MetropolisAdjustedLangevinSampler:
             # Propose a new sample
             mass_diag = mass_diag if not warm_up else jnp.ones_like(current_x)
 
-            proposed_x, metrop_hastings_ratio = self.compute_metropolis_hastings_ratio(current_x, current_grad, step_size, mass_diag, sub_key)
+            proposed_x, latent_log_prob_prop, latent_log_prob_curr, metrop_hastings_ratio = self.compute_metropolis_hastings_ratio(current_x, current_grad, step_size, mass_diag, sub_key)
 
             # MH Adjustment
             key, sub_key = jax.random.split(key)
             uniform_samp = jax.random.uniform(sub_key, (1,))[0]
             state = jnp.where(uniform_samp <= metrop_hastings_ratio, proposed_x, current_x)
+            latent_log_prob_state = jnp.where(uniform_samp <= metrop_hastings_ratio, latent_log_prob_prop, latent_log_prob_curr)
 
             num_accepted_samples += jnp.where(uniform_samp <= metrop_hastings_ratio, 1, 0)
 
@@ -361,7 +444,7 @@ class MetropolisAdjustedLangevinSampler:
                                     num_accepted_samples=num_accepted_samples,
                                     avg_mh_ratio=avg_mh_ratio)
 
-            return carry_state, (state, num_accepted_samples, avg_mh_ratio)
+            return carry_state, (state, latent_log_prob_state, num_accepted_samples, avg_mh_ratio)
     
         initial_ct = 0
         avg_mh_ratio = jnp.expand_dims(jnp.float32(0.), axis=0)
@@ -376,37 +459,38 @@ class MetropolisAdjustedLangevinSampler:
                                     rng_keys=init_keys,
                                     step_size=initial_step_size,
                                     num_accepted_samples=num_accepted_samples,
-                                    avg_mh_ratio=avg_mh_ratio)
-        carry_state, (stacked_states, stacked_num_accepted_samples, stacked_avg_mh_ratios) = jax.lax.scan(langevin_step, init_mala_state, None, num_steps)
+                                    avg_mh_ratio=avg_mh_ratio,
+                                    latent_log_prob_state=None)
 
-        return stacked_states, stacked_num_accepted_samples, stacked_avg_mh_ratios, carry_state
+        carry_state, (stacked_states, stacked_latent_log_prob_states, stacked_num_accepted_samples, stacked_avg_mh_ratio) = jax.lax.scan(langevin_step, init_mala_state, None, num_steps)
+
+        summary_stacked_states = StackedMALAStates(stacked_latent_states=stacked_states,
+                                                  stacked_latent_log_prob_states=stacked_latent_log_prob_states,
+                                                  stacked_num_accepted_samples=stacked_num_accepted_samples,
+                                                  stacked_avg_mh_ratios=stacked_avg_mh_ratio)
+
+        # FIXME: returning both the stacked and the last carry states is redundant. Use only the stacked states and extract the last state from it if needed.
+        return carry_state, summary_stacked_states
     
     def compute_metropolis_hastings_ratio(self, current_x: Array, current_grad: Array, step_size: float, mass_diag: Array, sub_key: Array) -> Tuple:
 
-        if self.support.name != "low_rank":
-            proposed_x = self.preconditioned_langevin_update(current_x, current_grad, step_size, mass_diag, sub_key, self.support.name)
-            log_prop_dist_forward =  self.log_proposal_dist(x=current_x,
-                                         y=proposed_x,
-                                         curr_step_size=step_size,
-                                         mass_diag=mass_diag)
-            log_prop_dist_backward = self.log_proposal_dist(x=proposed_x,
-                                            y=current_x,
-                                            curr_step_size=step_size,
-                                            mass_diag=mass_diag)
+        proposed_x = self.preconditioned_langevin_update(current_x, current_grad, step_size, mass_diag, sub_key)
+        log_prop_dist_forward =  self.log_proposal_dist(x=current_x,
+                                        y=proposed_x,
+                                        curr_step_size=step_size,
+                                        mass_diag=mass_diag)
+        log_prop_dist_backward = self.log_proposal_dist(x=proposed_x,
+                                        y=current_x,
+                                        curr_step_size=step_size,
+                                        mass_diag=mass_diag)
         
-        else:
-            proposed_x_summary = self.support.propose_bal_gauge_constrained_step(current_x, step_size)
-            log_prop_dist_forward = self.support.evaluate_bal_gauge_log_proposal_density(proposed_x_summary)
-            backward_noise, backward_velocity = self.support.invert_retraction(proposed_x_summary.state, current_x)
-            log_prop_dist_backward = self.support.evaluate_bal_gauge_log_proposal_density(self.support.StateSummary(state=current_x,
-                                                                                                                    matching_noise=backward_noise,
-                                                                                                                    velocities=backward_velocity))
-
         # MH log-ratio
+        latent_log_prob_prop = self.latent_log_prob_function(proposed_x)
+        latent_log_prob_curr = self.latent_log_prob_function(current_x)
         mh_log_ratio = (
-                self.latent_log_prob_function(proposed_x)
+                latent_log_prob_prop
                 + log_prop_dist_forward
-                - self.latent_log_prob_function(current_x)
+                - latent_log_prob_curr
                 - log_prop_dist_backward
             )
         mh_log_ratio = jnp.where(jnp.isfinite(mh_log_ratio), mh_log_ratio, -jnp.inf)
@@ -414,7 +498,7 @@ class MetropolisAdjustedLangevinSampler:
         metrop_hastings_ratio = jnp.where(metrop_hastings_ratio <= 1, metrop_hastings_ratio, 1)
         metrop_hastings_ratio = jnp.squeeze(metrop_hastings_ratio)
 
-        return proposed_x, metrop_hastings_ratio
+        return proposed_x, latent_log_prob_prop, latent_log_prob_curr, metrop_hastings_ratio
 
     def log_proposal_dist(self, x: Array, y: Array, curr_step_size: float, mass_diag: Array) -> float:
         r"""Computes the log transition probability density function at x given y:
@@ -429,9 +513,6 @@ class MetropolisAdjustedLangevinSampler:
             _type_: _description_
         """
         logger.info("Computing the log transition kernel")
-        if self.support.name == "low_rank":
-            return self.support.evaluate_bal_gauge_log_proposal_density(x, curr_step_size)
-
         diff = x - y - curr_step_size * mass_diag * self.latent_score_function(y)
         return - 0.5 * jnp.sum(jnp.square(diff) / (2 * curr_step_size * mass_diag))
 

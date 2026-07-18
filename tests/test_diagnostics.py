@@ -83,23 +83,20 @@ def test_ess_much_smaller_for_autocorrelated_chains():
 # eBFMI
 # --------------------------------------------------------------------------- #
 def test_ebfmi_well_mixed_exceeds_sticky():
+    # ebfmi now consumes stored per-draw ENERGIES (C, N), not state chains + a log_prob_fn.
     log_prob = lambda x: -0.5 * jnp.sum(x ** 2)
     well_mixed = _iid_chains(jax.random.key(5))
     sticky = _ar1_chains(jax.random.key(6), phi=0.99)
+    e_mixed = jax.vmap(jax.vmap(log_prob))(well_mixed)   # (C, N)
+    e_sticky = jax.vmap(jax.vmap(log_prob))(sticky)
     diag = MCMCDiagnostics(log_prob_fn=log_prob, constrained_chains=well_mixed)
 
-    bfmi_mixed = diag.ebfmi(well_mixed)
-    bfmi_sticky = diag.ebfmi(sticky)
+    bfmi_mixed = diag.ebfmi(e_mixed)
+    bfmi_sticky = diag.ebfmi(e_sticky)
 
     assert bfmi_mixed.shape == (4,)
     assert jnp.all(bfmi_mixed > 0) and jnp.all(jnp.isfinite(bfmi_mixed))
     assert jnp.min(bfmi_mixed) > jnp.max(bfmi_sticky), (float(jnp.min(bfmi_mixed)), float(jnp.max(bfmi_sticky)))
-
-
-def test_ebfmi_requires_log_prob_fn():
-    ch = _iid_chains(jax.random.key(7))
-    with pytest.raises(ValueError):
-        MCMCDiagnostics(log_prob_fn=None, constrained_chains=ch).ebfmi(ch)
 
 
 # --------------------------------------------------------------------------- #
@@ -113,7 +110,8 @@ def test_acceptance_rate():
 def test_summarize_keys_and_scalars():
     log_prob = lambda x: -0.5 * jnp.sum(x ** 2)
     ch = _iid_chains(jax.random.key(8))
-    out = MCMCDiagnostics(log_prob_fn=log_prob, constrained_chains=ch, latent_chains=ch).summarize()
+    energies = jax.vmap(jax.vmap(log_prob))(ch)   # (C, N) -- summarize reads stored energies for eBFMI
+    out = MCMCDiagnostics(log_prob_fn=log_prob, constrained_chains=ch, latent_log_prob_states=energies).summarize()
     for attr in ("bulk_rhat_max", "tail_rhat_max", "ess_min", "ebfmi_min"):
         assert jnp.ndim(getattr(out, attr)) == 0
 
