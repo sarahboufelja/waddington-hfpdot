@@ -198,3 +198,32 @@ class GMVAENet(nn.Module):
             categorical_loss=categorical_loss,
             total_loss=total_loss,
         )
+
+    # -- Stage A: plain-VAE pretraining (build a latent before the GMM is seeded) -------------------
+
+    def pretrain_parameters(self):
+        """The Stage A trainable set: encoder + decoder + per-gene dispersion, and ONLY those.
+
+        Explicitly EXCLUDES the GMM prior (mu_c, logvar_c, pi_logits) so it is impossible to update
+        the prior during pretraining -- the prior is set later by SEED, not learned in Stage A.
+        Enumerated from the concrete sub-modules rather than filtering ``parameters()``, because the
+        shared ``cluster_prior`` is a registered submodule of both nets and would otherwise leak in.
+        """
+        yield from self.inference_net.inference_qzx.parameters()   # encoder q(z|x)
+        yield from self.generative_net.generative_pxz.parameters()  # decoder p(x|z)
+        yield self.generative_net.log_dispersion                    # per-gene NB dispersion
+
+    def pretrain_loss(self, x, beta=1.0):
+        """Stage A objective: NB reconstruction + standard-normal KL (a plain VAE).
+
+        Builds a structured latent by training encoder + decoder (+ dispersion) BEFORE the GMM prior
+        is seeded; the mixture is not consulted here (no responsibilities), and the prior is N(0, I)
+        rather than the GMM. Returns ``(total, recon, kl)`` -- watching recon vs KL is the main
+        pretraining diagnostic. Decodes the sampled z (a training pass wants the reparam noise).
+        """
+        gauss = self.inference_net.q_zx(x)                          # mu, logvar, sampled z
+        x_recon = self.generative_net(gauss.latent_samples)
+        recon = self.losses.reconstruction_loss(x, x_recon, self.generative_net.dispersion)
+        zeros = torch.zeros_like(gauss.mu)
+        kl = self.losses.gaussian_kl_diag(gauss.mu, gauss.logvar, zeros, zeros).mean()  # KL(q||N(0,I))
+        return recon + beta * kl, recon, kl
