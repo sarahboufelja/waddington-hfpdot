@@ -23,17 +23,37 @@ dependencies = [
 data = [
     "h5py>=3.16.0",
 ]
+# The modelling stack for the Waddington layers (GMVAE embedding, wadd_dim_reduction). Optional
+# so a sampler-only install stays lean; the dev group below pulls it in for development.
+model = [
+    "torch>=2.10,<2.11",
+]
 
-# Development/test tooling. A dependency GROUP (PEP 735), not an optional extra, because uv
-# installs groups by DEFAULT on a bare `uv sync`: the test runner must never be behind a flag
-# you have to remember, and a plain `uv sync` must not silently uninstall it. It stays out of
-# `dependencies` because pytest is not a runtime requirement of the library.
+# Development tooling AND the full stack this project is developed against, as a dependency GROUP
+# (PEP 735): uv installs groups by DEFAULT on a bare `uv sync`, so everything here is always present
+# and a plain sync can never silently drop it (unlike optional extras, which are opt-in and were
+# repeatedly pruned). This is the single environment -- sampler (GPU jax), modelling (GPU torch),
+# data reader, and test runner -- that replaces the earlier .venv/conda split.
 [dependency-groups]
 dev = [
     "pytest>=8",
-    "arviz>=0.18",       # reference MCMC diagnostics, used for soundness cross-checks
-    "matplotlib>=3.8",   # plotting (sampler_viz, diagnostic visualizations)
+    "arviz>=0.18",        # reference MCMC diagnostics, used for soundness cross-checks
+    "matplotlib>=3.8",    # plotting (sampler_viz, diagnostic visualizations)
+    "h5py>=3.16.0",       # also in the `data` extra; here so the reader's tests always have it
+    "torch>=2.10,<2.11",  # also in the `model` extra; here so the GMVAE + its tests always run
+    "jax[cuda12]>=0.4",   # GPU acceleration for the sampler on this dev machine (CUDA 12 family)
 ]
+
+# torch's CUDA build is not on PyPI's default index. Pin it to the cu128 wheels (CUDA 12.8), which
+# run on this box's driver 550 via forward-compat -- the PyPI default is now a CUDA-13 build that
+# would need a newer driver. jax's GPU support comes from the [cuda12] extra (nvidia-* pip wheels).
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
 
 [build-system]
 requires = ["setuptools>=61"]
