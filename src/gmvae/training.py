@@ -54,6 +54,44 @@ def iter_minibatches(counts, batch_size, rng=None, shuffle=True, drop_last=True,
         yield torch.as_tensor(dense, device=device, dtype=dtype)
 
 
+def population_gmm_params(posterior, membership, temperature=0.5):
+    """The SEED computation: summarise each labelled population as one latent Gaussian, for
+    ClusterPrior.initialise. Pure numpy.
+
+    ``posterior`` is a CellPosterior over the labelled cells (their latent means/variances, from the
+    Stage-A-trained encoder); ``membership`` is a Membership over the SAME cells (soft weights
+    ``w[i,c]``, rows sum <= 1, so overlapping labels are already fractional upstream). Returns
+    ``(means[K,d], variances[K,d], weights[K])``.
+
+    Membership supplies the *which* (weights); the posterior supplies the *where* (latent
+    coordinates) -- neither alone is enough, since population centroids are points in the encoder's
+    latent space. Per population c:
+
+        mu_c   = weighted mean of the cell means            (centroid)
+        var_c  = within + between   (law of total variance):
+                   within  = weighted mean of cell variances     (measurement uncertainty)
+                   between = weighted Var of cell means           (population heterogeneity)
+        pi_c   propto n_c ** temperature   (n_c = effective count; temperature<1 tempers the
+                                            90:1 fate imbalance so rare fates survive)
+    """
+    W = membership.for_cells(posterior.cells)                # (n, K), alignment checked, not assumed
+    mu, var = posterior.means, posterior.variances           # (n, d)
+    n_c = W.sum(0)                                            # (K,) effective per-population counts
+    safe = np.maximum(n_c, 1e-12)[:, None]                   # avoid 0/0 for absent populations
+
+    mu_c = (W.T @ mu) / safe                                 # (K, d) weighted centroid
+    within = (W.T @ var) / safe                              # (K, d) mean within-cell variance
+    between = (W.T @ (mu ** 2)) / safe - mu_c ** 2           # (K, d) Var(mu_i) = E[mu^2] - E[mu]^2
+    var_c = within + np.maximum(between, 0.0)                # (K, d) total variance
+
+    empty = n_c == 0                                         # a population with no labelled cells
+    if empty.any():                                          # fall back to global stats, weight 0
+        mu_c[empty] = mu.mean(0)
+        var_c[empty] = var.mean(0) + mu.var(0)
+    weights = n_c ** temperature                            # tempered; initialise() softmaxes log
+    return mu_c, var_c, weights
+
+
 def pretrain(model, counts, epochs, batch_size, lr=1e-3, beta=1.0,
              device=None, rng=None, verbose=False):
     """Stage A: train the encoder + decoder (+ per-gene dispersion) as a plain VAE on the pooled

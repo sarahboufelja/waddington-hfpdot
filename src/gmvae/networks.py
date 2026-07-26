@@ -7,6 +7,8 @@ from gmvae.layers import Gaussian, GaussianOuts
 from gmvae.losses import LossFunctions
 
 _LOG_2PI = math.log(2.0 * math.pi)
+_SEED_VAR_FLOOR = 1e-8      # a zero-variance seed (a one-cell population) must not give log(0)
+_SEED_WEIGHT_FLOOR = 1e-8   # nor an empty population's zero weight
 
 @dataclass(frozen=True)
 class GMVAEOutput:
@@ -53,7 +55,34 @@ class ClusterPrior(nn.Module):
 
     def forward(self):
         return self.pi_logits, self.mu_c, self.logvar_c   # [K,], [K, d], [K, d]
-    
+
+    def initialise(self, means, variances, weights):
+        """Overwrite the GMM prior from a fit (population-seed or GMM), in place and without grad.
+
+        ``means``/``variances`` are ``(K, d)``, ``weights`` is ``(K,)``. Array-likes are accepted and
+        moved to the prior's device/dtype. This is an assignment, not a training step -- it is the
+        SEED phase, run once after Stage A. ``pi_logits`` is set to ``log(weights)``: softmax is
+        shift-invariant and normalises, so the weights need not pre-sum to 1, only be non-negative.
+        Floors guard ``log(0)`` from a zero-variance or empty-population seed (a rare late fate with a
+        single labelled cell is a real case here).
+        """
+        K, d = self.mu_c.shape
+        dev = self.mu_c.device
+        means = torch.as_tensor(means, dtype=self.mu_c.dtype, device=dev)
+        variances = torch.as_tensor(variances, dtype=self.logvar_c.dtype, device=dev)
+        weights = torch.as_tensor(weights, dtype=self.pi_logits.dtype, device=dev)
+        if means.shape != (K, d) or variances.shape != (K, d):
+            raise ValueError(f"means/variances must be {(K, d)}; got {tuple(means.shape)} / "
+                             f"{tuple(variances.shape)}")
+        if weights.shape != (K,):
+            raise ValueError(f"weights must be {(K,)}; got {tuple(weights.shape)}")
+        if torch.any(variances < 0) or torch.any(weights < 0):
+            raise ValueError("variances and weights must be non-negative")
+        with torch.no_grad():
+            self.mu_c.copy_(means)
+            self.logvar_c.copy_(torch.log(variances.clamp_min(_SEED_VAR_FLOOR)))
+            self.pi_logits.copy_(torch.log(weights.clamp_min(_SEED_WEIGHT_FLOOR)))
+
 class InferenceNet(nn.Module):
     def __init__(self, x_dim: int,
                 hidden_dim: int,
