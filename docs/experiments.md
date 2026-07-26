@@ -25,6 +25,20 @@ volume-term work is trying to move.
 > eBFMI is exempt from (2): it reads only `theta`, so trimming cannot touch it (verified
 > bit-identical, E7).
 >
+> **⚠ CRITICAL (2026-07-19): E5–E9 ALL RAN ON CPU.** Every experiment set `JAX_PLATFORMS=cpu` with
+> 4 *simulated* host devices, on a machine with **2× RTX 4070 Ti SUPER that were never used**.
+> - **Still valid:** eBFMI / R̂ / ESS are properties of the Markov chain (target, proposal, step size,
+>   seed) — hardware-independent. E8's 500-vs-1000 and E9's "N not m" conclusions stand.
+> - **NOT valid as stated:** every timing, and the whole feasibility/compute envelope. In particular
+>   "neither cell count converged at 5000 draws" may be an artifact of a CPU-sized budget — R̂ was
+>   still falling (1.91→1.79→1.73→1.66) and ESS still climbing (20→371) when we stopped.
+> - **Consequence:** **500 cells/day is a LOWER BOUND on the budget, not the answer.** Revisit after
+>   the pipeline lands, via a GPU calibration + long-run convergence test.
+>
+> **Convention (mandatory, from E10 onward): every script prints a device banner** (`device_info.
+> print_device_banner()`) and wraps runs in `GpuMonitor`, so a silent CPU fallback — or a run that
+> works only one of two GPUs — is visible in the output instead of being discovered weeks later.
+>
 > **Convention (mandatory, from E8 onward): every entry includes a `Reproduce:` line** — the exact
 > CLI command for a **committed** script under `scripts/experiments/` (the scratchpad is ephemeral).
 > One command, from the repo root, no reconstruction. (Earlier entries E1–E7 predate this; back-fill
@@ -451,7 +465,7 @@ Hypothesis was `exp` overflow. **Wrong** — `ell = UVᵀ−C/ε` maxes at **−
 +88 overflow. Actual chain:
 1. Sinkhorn at N=1000/ε=0.01 **underflows to exactly 0** in 2 entries (at N=500 the min was
    `6.99e-38`, just above float32's smallest normal `1.18e-38`, so it survived — a classic
-   "works at the size you tested" bug).
+   "works at the size it was tested at" bug).
 2. `to_unconstrained` guarded with `jnp.clip(pi, 1e-300, None)` — but **`1e-300` is below float32's
    smallest subnormal, so the floor itself underflows to `0.0` and the clip is a NO-OP.**
 3. `log(0) = -inf` → SVD receives `-inf` → LAPACK `SLASCL` error → `theta0 = NaN` → all NaN from

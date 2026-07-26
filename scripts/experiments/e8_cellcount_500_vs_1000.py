@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 import jax
 import jax.numpy as jnp
 import numpy as np
+from device_info import GpuMonitor, print_device_banner
 from langevin_sampler import MetropolisAdjustedLangevinSampler, HFPDOTHyperprior
 
 LATENT, EPS = 100, 1e-2
@@ -41,6 +42,14 @@ def build(N):
 
 
 def main():
+    # Announce the hardware: a silent CPU fallback turns every timing below into a CPU timing.
+    print_device_banner()
+    with GpuMonitor() as monitor:
+        _run()
+    print(monitor.summary(), flush=True)
+
+
+def _run():
     for N in (500, 1000):
         prior = build(N)
         s = MetropolisAdjustedLangevinSampler(

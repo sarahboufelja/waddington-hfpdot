@@ -433,7 +433,9 @@ class MetropolisAdjustedLangevinSampler:
             # * Clip the step size to avoid exploding values or very small values that would lead to numerical issues.
             # * The upper bound of 1 is chosen heuristically, while the lower bound of 1e-8 is chosen to avoid numerical
             #  issues in the log-probability and proposal distribution computations.
-            step_size = jnp.clip(step_size, a_min=1e-8, a_max=1)
+            # Positional bounds: numpy 2.0 renamed clip's `a_min`/`a_max` to `min`/`max` and jax
+            # followed (the old names were removed in jax 0.10). Positional works on both.
+            step_size = jnp.clip(step_size, 1e-8, 1)
             step_size = jnp.float32(step_size)
             # jax.debug.print("Current step size: {x}", x=step_size)
 

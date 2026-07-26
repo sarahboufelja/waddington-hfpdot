@@ -11,3 +11,7 @@ assets/images/
 # uv / virtualenv
 .venv/
 *.egg-info/
+
+docs/dev_timeline.md
+docs/math_audit.md
+docs/waddington_refactor_plan.md

@@ -18,6 +18,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Reading real single-cell data (10x-style HDF5 count matrices). Optional because the sampler
+# stack and the OT layer are usable -- and fully testable -- without any data files present.
+data = [
+    "h5py>=3.16.0",
+]
+
+# Development/test tooling. A dependency GROUP (PEP 735), not an optional extra, because uv
+# installs groups by DEFAULT on a bare `uv sync`: the test runner must never be behind a flag
+# you have to remember, and a plain `uv sync` must not silently uninstall it. It stays out of
+# `dependencies` because pytest is not a runtime requirement of the library.
+[dependency-groups]
 dev = [
     "pytest>=8",
     "arviz>=0.18",       # reference MCMC diagnostics, used for soundness cross-checks

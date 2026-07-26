@@ -398,8 +398,9 @@ name = "h5py"
 version = "3.16.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version != '3.11.*'" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/db/33/acd0ce6863b6c0d7735007df01815403f5589a21ff8c2e1ee2587a38f548/h5py-3.16.0.tar.gz", hash = "sha256:a0dbaad796840ccaa67a4c144a0d0c8080073c34c76d5a6941d6818678ef2738", size = 446526, upload-time = "2026-03-06T13:49:08.07Z" }
 wheels = [
@@ -1818,6 +1819,11 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+data = [
+    { name = "h5py" },
+]
+
+[package.dev-dependencies]
 dev = [
     { name = "arviz", version = "0.23.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "arviz", version = "1.2.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -1828,15 +1834,20 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "arviz", marker = "extra == 'dev'", specifier = ">=0.18" },
+    { name = "h5py", marker = "extra == 'data'", specifier = ">=3.16.0" },
     { name = "jax", specifier = ">=0.4" },
-    { name = "matplotlib", marker = "extra == 'dev'", specifier = ">=3.8" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "pot", specifier = ">=0.9" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "scipy", specifier = ">=1.10" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["data"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "arviz", specifier = ">=0.18" },
+    { name = "matplotlib", specifier = ">=3.8" },
+    { name = "pytest", specifier = ">=8" },
+]
 
 [[package]]
 name = "xarray"

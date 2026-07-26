@@ -21,6 +21,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from langevin_sampler import HFPDOTHyperprior, MetropolisAdjustedLangevinSampler
@@ -109,3 +110,140 @@ def test_unbalanced_hfpdot_samples_are_positive_on_orthant():
     out = _sample(prior, II * JJ, "positive_orthant", prior.unbalanced_hyperprior_log_prob_fun, step_size=0.05)
     assert out.shape == (1000, II * JJ)
     assert jnp.all(out > 0) and jnp.all(jnp.isfinite(out))
+
+
+# --------------------------------------------------------------------------- #
+# The log-density IS the HFPD-OT hyperprior.
+#
+# The tests above check internal consistency (score == grad, samples on support).
+# These pin the target itself to its mathematical definition, so it cannot drift:
+#
+#   S(pi) ∝ exp[-l1 KL(mu||mu_0)] · exp[-l2 KL(nu||nu_0)] · Sbase(pi)
+#
+# with mu, nu the first/second marginals of pi, and Sbase the entropic-OT Gibbs
+# measure with reference plan pi_I = exp(-C/eps). Unbalanced uses the generalized
+# KL for positive measures, KL(p||q) = Σ p log(p/q) - Σ p + Σ q; balanced uses the
+# shifted KL (same, without the mass terms).
+# --------------------------------------------------------------------------- #
+
+SMOOTH = 1e-9  # smoothing used inside the divergences
+
+
+def _gen_kl_ref(p, q, e=SMOOTH):
+    """Reference generalized KL for positive measures: Σ p log(p/q) - Σ p + Σ q."""
+    p, q = np.asarray(p, float), np.asarray(q, float)
+    return float(np.sum((p + e) * np.log((p + e) / (q + e))) - np.sum(p) + np.sum(q))
+
+
+def _shifted_kl_ref(p, q, e=SMOOTH):
+    """Reference shifted KL: Σ p log(p/q) (no mass-balancing terms)."""
+    p, q = np.asarray(p, float), np.asarray(q, float)
+    return float(np.sum((p + e) * np.log((p + e) / (q + e))))
+
+
+def _scalar(x):
+    return float(np.asarray(x).ravel()[0])
+
+
+def test_generalized_kl_matches_positive_measure_definition():
+    rng = np.random.default_rng(1)
+    p, q = np.abs(rng.normal(size=8)), np.abs(rng.normal(size=8))
+    got = _scalar(HFPDOTHyperprior.generalized_kl_div(jnp.asarray(p), jnp.asarray(q)))
+    assert np.isclose(got, _gen_kl_ref(p, q))
+
+
+def test_generalized_kl_vanishes_at_equality_and_penalises_mass_mismatch():
+    """The -Σp + Σq terms are what make it valid for unnormalised measures."""
+    rng = np.random.default_rng(2)
+    p = np.abs(rng.normal(size=8)) + 0.1
+    assert np.isclose(_scalar(HFPDOTHyperprior.generalized_kl_div(jnp.asarray(p), jnp.asarray(p))),
+                      0.0, atol=1e-6)
+    assert _scalar(HFPDOTHyperprior.generalized_kl_div(jnp.asarray(p), jnp.asarray(2.0 * p))) > 0.0
+
+
+def test_shifted_kl_is_generalized_kl_without_mass_terms():
+    rng = np.random.default_rng(3)
+    p, q = np.abs(rng.normal(size=8)), np.abs(rng.normal(size=8))
+    shifted = _scalar(HFPDOTHyperprior.shifted_kl_div(jnp.asarray(p), jnp.asarray(q)))
+    generalized = _scalar(HFPDOTHyperprior.generalized_kl_div(jnp.asarray(p), jnp.asarray(q)))
+    assert np.isclose(shifted, _shifted_kl_ref(p, q))
+    assert np.isclose(shifted, generalized + np.sum(p) - np.sum(q))
+
+
+def test_reference_plan_is_the_entropic_ot_kernel():
+    """pi_I must be the Gibbs kernel exp(-C/eps) -- the base design of the hyperprior."""
+    prior, II, JJ = _make_prior()
+    cost = np.asarray(prior.cost_fn).reshape(II, JJ)
+    assert np.allclose(np.asarray(prior.pi_I).reshape(II, JJ), np.exp(-cost / prior.epsilon))
+
+
+def test_base_term_encodes_transport_cost_and_entropy():
+    """-KL(pi||pi_I) == H(pi) - (1/eps)<C,pi> + Σpi - Σpi_I: the entropic-OT objective."""
+    k1, k2 = jax.random.split(jax.random.key(11))
+    II = JJ = 4
+    eps = 1.0                                    # large enough that SMOOTH is negligible
+    cost = np.asarray(jax.random.uniform(k1, (II, JJ), minval=0.0, maxval=2.0))
+    prior = HFPDOTHyperprior(mu_0=np.full(II, 1 / II), nu_0=np.full(JJ, 1 / JJ),
+                             lambda_1=0.0, lambda_2=0.0, lambda_I_1=0.0, lambda_I_2=0.0,
+                             cost_fn=cost, epsilon=eps)
+    pi = np.abs(np.asarray(jax.random.normal(k2, (1, II * JJ)))) * 0.05
+    got = -_scalar(HFPDOTHyperprior.generalized_kl_div(jnp.asarray(pi), prior.pi_I))
+    entropy = -np.sum(pi * np.log(pi))                        # H(pi)
+    transport = np.sum(pi * cost.reshape(1, -1)) / eps        # (1/eps) <C, pi>
+    expected = entropy - transport + np.sum(pi) - np.sum(np.asarray(prior.pi_I))
+    assert np.isclose(got, expected, rtol=1e-4)
+
+
+@pytest.mark.parametrize("balanced", [True, False])
+def test_log_density_matches_the_hyperprior_definition(balanced):
+    """Reconstruct S(pi) term-by-term from the definition and compare with the implementation."""
+    prior, II, JJ = _make_prior()
+    rng = np.random.default_rng(4)
+    pi = np.abs(rng.normal(size=(1, II * JJ))) * 0.05
+    pi_mat = pi.reshape(II, JJ)
+    div = _shifted_kl_ref if balanced else _gen_kl_ref
+
+    mu, nu = pi_mat.sum(axis=1), pi_mat.sum(axis=0)           # first / second marginals
+    expected = (
+        -(prior.lambda_1 + prior.lambda_I_1) * div(mu, np.asarray(prior.mu_0))
+        - (prior.lambda_2 + prior.lambda_I_2) * div(nu, np.asarray(prior.nu_0))
+        - div(pi, np.asarray(prior.pi_I))
+    )
+    fn = prior.balanced_hyperprior_log_prob_fun if balanced else prior.unbalanced_hyperprior_log_prob_fun
+    assert np.isclose(_scalar(fn(jnp.asarray(pi))), expected, rtol=1e-5)
+
+
+def test_constrained_marginals_are_row_and_column_sums():
+    """Redistributing mass within rows preserves mu, so the first marginal term is unchanged."""
+    prior, II, JJ = _make_prior()
+    rng = np.random.default_rng(5)
+    pi_mat = np.abs(rng.normal(size=(II, JJ))) * 0.05
+    shuffled = np.stack([rng.permutation(row) for row in pi_mat])   # same row sums, different cols
+    assert np.allclose(shuffled.sum(axis=1), pi_mat.sum(axis=1))
+    assert not np.allclose(shuffled.sum(axis=0), pi_mat.sum(axis=0))
+    mu_0 = np.asarray(prior.mu_0)
+    assert np.isclose(_gen_kl_ref(pi_mat.sum(axis=1), mu_0), _gen_kl_ref(shuffled.sum(axis=1), mu_0))
+
+
+def test_base_design_mode_is_the_reference_plan():
+    """With the marginal terms switched off, S is maximised exactly at pi = pi_I = exp(-C/eps)."""
+    II = JJ = 3
+    cost = np.asarray(jax.random.uniform(jax.random.key(13), (II, JJ), minval=0.0, maxval=2.0))
+    prior = HFPDOTHyperprior(mu_0=np.full(II, 1 / II), nu_0=np.full(JJ, 1 / JJ),
+                             lambda_1=0.0, lambda_2=0.0, lambda_I_1=0.0, lambda_I_2=0.0,
+                             cost_fn=cost, epsilon=0.5, support="positive_orthant")
+    pi_I = np.asarray(prior.pi_I)
+    lp_mode = _scalar(prior.hyperprior_log_prob_fun(jnp.asarray(pi_I)))
+    assert np.isclose(lp_mode, 0.0, atol=1e-6)               # KL(p||p) = 0
+
+    rng = np.random.default_rng(6)
+    for _ in range(50):
+        pert = np.abs(pi_I + rng.normal(scale=0.1 * pi_I.std(), size=pi_I.shape))
+        assert _scalar(prior.hyperprior_log_prob_fun(jnp.asarray(pert))) <= lp_mode + 1e-9
+
+
+def test_unsupported_support_raises():
+    prior, II, JJ = _make_prior()
+    prior.support = "klein_bottle"
+    with pytest.raises(ValueError):
+        prior.hyperprior_log_prob_fun(jnp.zeros((1, II * JJ)))

@@ -16,3 +16,15 @@ os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=2")
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+
+def pytest_report_header(config):
+    """Announce the hardware every run, so nobody has to guess what a timing means.
+
+    CPU is pinned above on purpose here, so the banner's "GPUs idle" alarm is suppressed -- it stays
+    meaningful for scripts and experiments, where an unnoticed CPU fallback silently turns every
+    timing into a CPU timing.
+    """
+    from device_info import device_banner
+
+    return device_banner(cpu_is_intentional=True)

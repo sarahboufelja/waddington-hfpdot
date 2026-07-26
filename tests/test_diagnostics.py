@@ -89,7 +89,7 @@ def test_ebfmi_well_mixed_exceeds_sticky():
     sticky = _ar1_chains(jax.random.key(6), phi=0.99)
     e_mixed = jax.vmap(jax.vmap(log_prob))(well_mixed)   # (C, N)
     e_sticky = jax.vmap(jax.vmap(log_prob))(sticky)
-    diag = MCMCDiagnostics(log_prob_fn=log_prob, constrained_chains=well_mixed)
+    diag = MCMCDiagnostics(constrained_chains=well_mixed)
 
     bfmi_mixed = diag.ebfmi(e_mixed)
     bfmi_sticky = diag.ebfmi(e_sticky)
@@ -111,7 +111,7 @@ def test_summarize_keys_and_scalars():
     log_prob = lambda x: -0.5 * jnp.sum(x ** 2)
     ch = _iid_chains(jax.random.key(8))
     energies = jax.vmap(jax.vmap(log_prob))(ch)   # (C, N) -- summarize reads stored energies for eBFMI
-    out = MCMCDiagnostics(log_prob_fn=log_prob, constrained_chains=ch, latent_log_prob_states=energies).summarize()
+    out = MCMCDiagnostics(constrained_chains=ch, latent_log_prob_states=energies).summarize()
     for attr in ("bulk_rhat_max", "tail_rhat_max", "ess_min", "ebfmi_min"):
         assert jnp.ndim(getattr(out, attr)) == 0
 
