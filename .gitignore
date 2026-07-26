@@ -1,7 +1,6 @@
 __pycache__/
 *.pyc
 data/
-gmvae/
 .DS_Store
 .ipynb_checkpoints/
 .vscode/
