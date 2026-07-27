@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from scipy import sparse
 
+from gmvae.embedder import VaDEEmbedder
 from gmvae.networks import GMVAENet
 from wadd_data_ingest import ExpressionMatrix, Membership
 from wadd_dim_reduction import CellPosterior
@@ -125,7 +126,14 @@ def population_gmm_params(posterior: CellPosterior, membership: Membership,
                                             90:1 fate imbalance so rare fates survive)
     """
     W = membership.for_cells(posterior.cells)                # (n, K), alignment checked, not assumed
-    mu, var = posterior.means, posterior.variances           # (n, d)
+    return _gmm_from_arrays(W, posterior.means, posterior.variances, temperature)
+
+
+def _gmm_from_arrays(W: Array, mu: Array, var: Array, temperature: float) -> Tuple[Array, Array,
+                                                                                   Array]:
+    """The weighted GMM reduction shared by the single- and multi-day seed paths. ``W`` (n, K) is the
+    membership weights, ``mu``/``var`` (n, d) the cells' latent moments; rows may be pooled across
+    days (unlabelled cells carry a zero W row and so contribute nothing)."""
     n_c = W.sum(0)                                            # (K,) effective per-population counts
     safe = np.maximum(n_c, 1e-12)[:, None]                   # avoid 0/0 for absent populations
 
@@ -260,3 +268,67 @@ def joint_train(model: GMVAENet, counts: CSR, targets: Array, class_weights: Arr
             print(f"[joint] epoch {epoch + 1}/{epochs}  "
                   f"loss={row[0]:.3f}  elbo={row[1]:.3f}  anchor={row[2]:.3f}")
     return np.asarray(history)
+
+
+# --------------------------------------------------------------------------------------------------
+# SEED phase orchestration + the full two-stage driver
+# --------------------------------------------------------------------------------------------------
+
+def seed_prior(model: GMVAENet, matrices: Sequence[ExpressionMatrix],
+               memberships: Sequence[Membership], population_names: Sequence[str],
+               temperature: float = 0.5, batch_size: int = 4096, device=None) -> None:
+    """SEED: population-seed the GMM prior from the Stage-A-trained encoder, in place.
+
+    Embeds each day's cells (``VaDEEmbedder``, eval + no_grad) and aggregates the labelled cells
+    ACROSS days into one weighted GMM reduction, then writes it into ``model.cluster_prior``. The
+    whole day is embedded; unlabelled cells carry a zero membership row and contribute nothing, so no
+    subsetting is needed. ``matrices`` and ``memberships`` are parallel per-day lists.
+    """
+    if len(matrices) != len(memberships):
+        raise ValueError(f"{len(matrices)} matrices but {len(memberships)} memberships")
+    names = list(population_names)
+    embedder = VaDEEmbedder(model, device=device, batch_size=batch_size)
+
+    mus, variances, weights = [], [], []
+    for m, memb in zip(matrices, memberships):
+        if list(memb.population_names) != names:
+            raise ValueError("population axes differ across days; align columns before seeding")
+        post = embedder.embed(m)                              # CellPosterior over this day's cells
+        weights.append(memb.for_cells(post.cells))            # (n_day, K), alignment checked
+        mus.append(post.means)
+        variances.append(post.variances)
+
+    W = np.vstack(weights)                                    # all cells across days
+    means, vars_c, w_c = _gmm_from_arrays(W, np.vstack(mus), np.vstack(variances), temperature)
+    model.cluster_prior.initialise(means, vars_c, w_c)
+
+
+def train(model: GMVAENet, matrices: Sequence[ExpressionMatrix],
+          memberships: Sequence[Membership], population_names: Sequence[str],
+          pretrain_epochs: int, joint_epochs: int, batch_size: int, lambda_sup: float = 1.0,
+          class_weight_scheme: str = "uniform", temperature: float = 0.5, lr: float = 1e-3,
+          device=None, rng: Optional[np.random.Generator] = None,
+          verbose: bool = False) -> Tuple[Array, Array]:
+    """The full two-stage driver: Stage A (pretrain) -> SEED (population-seed the prior) -> Stage B
+    (joint ELBO + anchor). Single-device; multi-GPU is a later step. Returns
+    ``(pretrain_history, joint_history)``.
+
+    ``matrices``/``memberships`` are parallel per-day lists; ``population_names`` fixes the K-column
+    order used for both the seed and the anchor targets, so a component always indexes the same fate.
+    """
+    device = torch.device(device) if device is not None else \
+        torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    rng = rng if rng is not None else np.random.default_rng(0)
+
+    counts = pool_counts(matrices)                            # all days, one CSR
+    pre_hist = pretrain(model, counts, pretrain_epochs, batch_size, lr=lr, device=device, rng=rng,
+                        verbose=verbose)                     # Stage A (GMM prior untouched)
+    seed_prior(model, matrices, memberships, population_names, temperature=temperature,
+               batch_size=batch_size, device=device)         # SEED
+
+    targets = build_targets(matrices, memberships, population_names)
+    counts_per_pop = sum(np.asarray(memb.matrix).sum(0) for memb in memberships)   # (K,)
+    cw = class_weights(counts_per_pop, class_weight_scheme)
+    joint_hist = joint_train(model, counts, targets, cw, joint_epochs, batch_size,
+                             lambda_sup=lambda_sup, lr=lr, device=device, rng=rng, verbose=verbose)
+    return pre_hist, joint_hist
