@@ -55,3 +55,27 @@ class LossFunctions:
         gamma = torch.exp(log_gamma_c)                    # log_gamma_c is already log-normalised
         log_pi = F.log_softmax(pi_logits, dim=-1)
         return torch.mean(torch.sum(gamma * (log_gamma_c - log_pi), axis=-1))
+
+    def anchor_loss(self, log_gamma_c, targets, class_weights):
+        r"""Stage B supervised anchor: soft multi-label cross-entropy on the labelled cells,
+        class-balanced. Pulls each labelled cell's responsibilities toward its (soft) label target,
+        which keeps the GMM components pinned to the populations during joint training.
+
+            L = mean_{i labelled} [ - sum_c w_c * t_{i,c} * log gamma_{i,c} ]
+
+        - ``log_gamma_c`` [B, K]: log responsibilities from the forward pass.
+        - ``targets`` [B, K]: soft label targets, renormalised to a distribution for labelled cells
+          and all-zero for unlabelled cells (which therefore contribute nothing).
+        - ``class_weights`` [K]: per-population balance weights ``w_c``, folded into the class sum so
+          an ambiguous (multi-membership) cell weights each of its populations by that population's
+          own ``w_c`` -- no single per-cell class is assumed.
+
+        The mean is over the labelled cells in the batch (not the whole batch), so ``lambda_sup``
+        trades per-labelled-cell supervision against the per-cell ELBO at a scale that does not drift
+        with how many labelled cells a random batch happens to contain.
+        """
+        labelled = targets.sum(-1) > 0                     # [B]; unlabelled rows are all-zero
+        if not bool(labelled.any()):
+            return log_gamma_c.new_zeros(())               # no labelled cells in this batch -> 0
+        per_cell = -(class_weights * targets * log_gamma_c).sum(-1)   # [B]
+        return per_cell[labelled].mean()                   # mean over labelled-in-batch

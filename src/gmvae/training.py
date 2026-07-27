@@ -5,20 +5,43 @@ time-conditional (day feeds the downstream transport layer, not the encoder). So
 per-day ``ExpressionMatrix`` objects concatenated into one big sparse matrix, iterated as
 global-shuffled minibatches that mix timepoints (per-day batches would bias BatchNorm and let the
 encoder learn a day shortcut).
+
+Two layers live here:
+
+* **setup** (numpy, run once): ``pool_counts``, ``build_targets``, ``population_gmm_params``,
+  ``class_weights`` -- prepare the big arrays from numpy inputs. Not differentiable, not in any hot
+  loop, so numpy/CPU, and deliberately kept CPU so the per-batch GPU transfer happens in one place.
+* **runtime** (torch, per-batch): ``iter_minibatches`` / ``iter_labelled_minibatches`` (the GPU
+  boundary) and the training loops. These slice the setup arrays one batch at a time and move that
+  batch to the device.
 """
 from __future__ import annotations
+
+from typing import Iterator, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from scipy import sparse
 
+from gmvae.networks import GMVAENet
+from wadd_data_ingest import ExpressionMatrix, Membership
+from wadd_dim_reduction import CellPosterior
 
-def pool_counts(matrices):
+Array = np.ndarray
+CSR = sparse.csr_matrix
+
+
+# --------------------------------------------------------------------------------------------------
+# Setup layer (numpy, one-time)
+# --------------------------------------------------------------------------------------------------
+
+def pool_counts(matrices: Sequence[ExpressionMatrix]) -> CSR:
     """Concatenate per-day sparse count matrices into one ``(n_total, n_genes)`` CSR.
 
     The pooled object is deliberately NOT an ``ExpressionMatrix`` -- that is single-day by contract
     (its ``CellAxis`` carries one day). Cell identity and day are irrelevant to Stage A training, so
-    the pool is just the counts; label alignment for Stage B is done separately, once, at pool time.
+    the pool is just the counts; label alignment for Stage B is done separately, once (see
+    ``build_targets``).
 
     Pooling requires a shared gene axis (same genes, same order); a differing order is a hard stop,
     because vstack would silently misalign features. Reordering to a canonical axis is a separate
@@ -34,27 +57,54 @@ def pool_counts(matrices):
     return sparse.vstack([m.counts for m in matrices]).tocsr()
 
 
-def iter_minibatches(counts, batch_size, rng=None, shuffle=True, drop_last=True,
-                     device=None, dtype=torch.float32):
-    """Yield dense count minibatches over a pooled CSR, on ``device``.
+def build_targets(matrices: Sequence[ExpressionMatrix], memberships: Sequence[Membership],
+                  population_names: Sequence[str]) -> Array:
+    """Row-aligned soft label targets ``(n_total, K)`` for the pooled counts (Stage B anchor).
 
-    One densify per batch -> peak memory is ``batch x genes``. ``drop_last`` guards a real BatchNorm
-    crash: BatchNorm1d in train mode raises on a batch of size 1, so a final singleton batch must be
-    dropped. Pass a caller-owned ``rng`` (a numpy Generator) so successive epochs get different
-    permutations while the whole run stays reproducible; creating the rng inside would reshuffle
-    identically every epoch.
+    ``matrices`` and ``memberships`` are parallel per-day lists in the SAME order as ``pool_counts``,
+    so the target rows line up with the pooled count rows. Each day's membership is aligned to that
+    day's cells (``for_cells`` runs ``require_same`` on day + cell order), then renormalised to a
+    distribution over the ``K`` populations for labelled cells (row sums to 1) and left all-zero for
+    unlabelled cells -- which therefore contribute nothing to the anchor.
+
+    ``population_names`` fixes the column order; it must match the order used to seed the GMM prior,
+    so a target column indexes the same component as the corresponding responsibility.
     """
-    n = counts.shape[0]
-    order = rng.permutation(n) if (shuffle and rng is not None) else np.arange(n)
-    for start in range(0, n, batch_size):
-        idx = order[start:start + batch_size]
-        if drop_last and len(idx) < batch_size:
-            break
-        dense = np.asarray(counts[idx].todense(), dtype=np.float32)
-        yield torch.as_tensor(dense, device=device, dtype=dtype)
+    if len(matrices) != len(memberships):
+        raise ValueError(f"{len(matrices)} matrices but {len(memberships)} memberships")
+    names = list(population_names)
+    rows = []
+    for m, memb in zip(matrices, memberships):
+        if list(memb.population_names) != names:
+            raise ValueError("population axes differ across days; align the columns before "
+                             "building targets")
+        M = memb.for_cells(m.cells)                              # (n_day, K), alignment checked
+        s = M.sum(1, keepdims=True)
+        rows.append(np.divide(M, s, out=np.zeros_like(M), where=s > 0))   # labelled -> sum 1; else 0
+    return np.vstack(rows)
 
 
-def population_gmm_params(posterior, membership, temperature=0.5):
+def class_weights(counts_per_pop: Array, scheme: str = "uniform") -> Array:
+    """Per-population balance weights ``w_c`` for the anchor, normalised to mean 1.
+
+    ``uniform`` (all ones) is the starting choice; ``inverse`` / ``inverse_sqrt`` upweight rare fates
+    to counter the ~90:1 imbalance, to be tuned once the system runs. Normalising to mean 1 keeps the
+    anchor's overall scale (and thus ``lambda_sup``) comparable across schemes.
+    """
+    n = np.maximum(np.asarray(counts_per_pop, dtype=float), 1e-12)
+    if scheme == "uniform":
+        w = np.ones_like(n)
+    elif scheme == "inverse":
+        w = 1.0 / n
+    elif scheme == "inverse_sqrt":
+        w = 1.0 / np.sqrt(n)
+    else:
+        raise ValueError(f"unknown class-weight scheme {scheme!r}")
+    return w * (len(w) / w.sum())                               # mean(w) == 1
+
+
+def population_gmm_params(posterior: CellPosterior, membership: Membership,
+                          temperature: float = 0.5) -> Tuple[Array, Array, Array]:
     """The SEED computation: summarise each labelled population as one latent Gaussian, for
     ClusterPrior.initialise. Pure numpy.
 
@@ -92,8 +142,55 @@ def population_gmm_params(posterior, membership, temperature=0.5):
     return mu_c, var_c, weights
 
 
-def pretrain(model, counts, epochs, batch_size, lr=1e-3, beta=1.0,
-             device=None, rng=None, verbose=False):
+# --------------------------------------------------------------------------------------------------
+# Runtime layer (torch, per-batch): the sparse->dense->device boundary
+# --------------------------------------------------------------------------------------------------
+
+def _batch_slices(n: int, batch_size: int, rng: Optional[np.random.Generator],
+                  shuffle: bool, drop_last: bool) -> Iterator[Array]:
+    """Yield row-index slices for one epoch. Shared by the labelled/unlabelled feeders so the
+    shuffle, batching, and drop_last logic lives in exactly one place. A caller-owned ``rng`` gives
+    reproducible per-epoch permutations; creating one inside would reshuffle identically every epoch.
+    """
+    order = rng.permutation(n) if (shuffle and rng is not None) else np.arange(n)
+    for start in range(0, n, batch_size):
+        idx = order[start:start + batch_size]
+        if drop_last and len(idx) < batch_size:                # only the final slice can be short
+            return
+        yield idx
+
+
+def _dense_batch(counts: CSR, idx: Array, device, dtype: torch.dtype) -> torch.Tensor:
+    """Densify the given rows and move them to the device. The one sparse->dense->GPU boundary."""
+    dense = np.asarray(counts[idx].todense(), dtype=np.float32)
+    return torch.as_tensor(dense, device=device, dtype=dtype)
+
+
+def iter_minibatches(counts: CSR, batch_size: int, targets: Optional[Array] = None,
+                     rng: Optional[np.random.Generator] = None, shuffle: bool = True,
+                     drop_last: bool = True, device=None, dtype: torch.dtype = torch.float32
+                     ) -> Iterator[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    """Yield ``(counts_batch, targets_batch)`` minibatches over a pooled CSR, on ``device``.
+
+    ``targets`` is the row-aligned label array from ``build_targets`` (Stage B); pass ``None`` for
+    Stage A, in which case the second element of each yield is ``None``. Counts and targets are always
+    sliced by the SAME shuffle, so their rows stay aligned.
+
+    One densify per batch -> peak memory is ``batch x genes``. ``drop_last`` guards a real BatchNorm
+    crash: BatchNorm1d in train mode raises on a batch of size 1, so a final singleton batch is
+    dropped.
+    """
+    if targets is not None and targets.shape[0] != counts.shape[0]:
+        raise ValueError(f"targets has {targets.shape[0]} rows for {counts.shape[0]} count rows")
+    for idx in _batch_slices(counts.shape[0], batch_size, rng, shuffle, drop_last):
+        x = _dense_batch(counts, idx, device, dtype)
+        t = None if targets is None else torch.as_tensor(targets[idx], device=device, dtype=dtype)
+        yield x, t
+
+
+def pretrain(model: GMVAENet, counts: CSR, epochs: int, batch_size: int, lr: float = 1e-3,
+             beta: float = 1.0, device=None, rng: Optional[np.random.Generator] = None,
+             verbose: bool = False) -> Array:
     """Stage A: train the encoder + decoder (+ per-gene dispersion) as a plain VAE on the pooled
     counts, so the latent has structure before the GMM prior is seeded.
 
@@ -111,7 +208,7 @@ def pretrain(model, counts, epochs, batch_size, lr=1e-3, beta=1.0,
     history = []
     for epoch in range(epochs):
         parts = []
-        for x in iter_minibatches(counts, batch_size, rng=rng, device=device):
+        for x, _ in iter_minibatches(counts, batch_size, rng=rng, device=device):
             opt.zero_grad()
             loss, recon, kl = model.pretrain_loss(x, beta=beta)
             loss.backward()
@@ -122,4 +219,44 @@ def pretrain(model, counts, epochs, batch_size, lr=1e-3, beta=1.0,
         if verbose:
             print(f"[pretrain] epoch {epoch + 1}/{epochs}  "
                   f"loss={row[0]:.3f}  recon={row[1]:.3f}  kl={row[2]:.3f}")
+    return np.asarray(history)
+
+
+def joint_train(model: GMVAENet, counts: CSR, targets: Array, class_weights: Array, epochs: int,
+                batch_size: int, lambda_sup: float = 1.0, lr: float = 1e-3, device=None,
+                rng: Optional[np.random.Generator] = None, verbose: bool = False) -> Array:
+    """Stage B: joint training on the seeded model. Per batch,
+
+        L = ELBO(all cells)  +  lambda_sup * anchor(labelled cells),
+
+    optimised over ALL parameters -- crucially the GMM prior trains now (unlike Stage A), and the
+    anchor is what keeps it pinned to the populations while it moves. The ELBO's KL weight is the
+    model's own ``beta``; ``lambda_sup`` is the fixed anchor weight (both tuned later). ``targets``
+    is from ``build_targets`` (row-aligned to ``counts``); ``class_weights`` is per-population.
+    Returns a ``(epochs, 3)`` array of per-epoch mean ``(total, elbo, anchor)``.
+    """
+    device = torch.device(device) if device is not None else \
+        torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device).train()
+    opt = torch.optim.Adam(model.parameters(), lr=lr)           # ALL params, incl. the GMM prior
+    cw = torch.as_tensor(class_weights, dtype=torch.float32, device=device)
+    rng = rng if rng is not None else np.random.default_rng(0)
+
+    history = []
+    for epoch in range(epochs):
+        parts = []
+        for x, t in iter_minibatches(counts, batch_size, targets=targets, rng=rng, device=device):
+            opt.zero_grad()
+            out = model(x)                                      # VaDE forward -> ELBO in out.total_loss
+            anchor = model.losses.anchor_loss(out.log_gamma_c, t, cw)
+            loss = out.total_loss + lambda_sup * anchor
+            loss.backward()
+            opt.step()
+            parts.append((float(loss.detach()), float(out.total_loss.detach()),
+                          float(anchor.detach())))
+        row = np.mean(parts, axis=0)
+        history.append(row)
+        if verbose:
+            print(f"[joint] epoch {epoch + 1}/{epochs}  "
+                  f"loss={row[0]:.3f}  elbo={row[1]:.3f}  anchor={row[2]:.3f}")
     return np.asarray(history)
