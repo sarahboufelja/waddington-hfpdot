@@ -5,6 +5,7 @@ data/
 .ipynb_checkpoints/
 .vscode/
 assets/images/
+assets/gmvae_runs/
 .pytest_cache/
 
 # uv / virtualenv
