@@ -176,11 +176,14 @@ def test_build_targets_renormalises_and_aligns_to_pool_order():
     assert np.allclose(T[3], [1.0, 0.0])                      # 0.3 on A renormalised to 1.0
 
 
-def test_build_targets_rejects_a_differing_population_axis():
+def test_build_targets_aligns_a_differing_population_axis():
+    """A differing (but valid) column order is aligned to the canonical axis, not rejected: the
+    membership is [A, B]; requesting [B, A] swaps the columns so each cell lands under its true fate."""
     m = _day(2, 9, 0)
-    memb = _day_membership([[1.0, 0.0], [0.0, 1.0]], 9)
-    with pytest.raises(ValueError, match="population axes differ"):
-        build_targets([m], [memb], ["B", "A"])               # wrong column order
+    memb = _day_membership([[1.0, 0.0], [0.0, 1.0]], 9)       # cell0 -> A, cell1 -> B
+    T = build_targets([m], [memb], ["B", "A"])
+    assert np.allclose(T, [[0.0, 1.0],                        # cell0 A -> column 1 of [B, A]
+                           [1.0, 0.0]])                       # cell1 B -> column 0
 
 
 def test_class_weights_schemes():

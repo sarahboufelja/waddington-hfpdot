@@ -27,6 +27,17 @@ from gmvae.embedder import VaDEEmbedder
 from gmvae.networks import GMVAENet
 from wadd_data_ingest import ExpressionMatrix, Membership
 from wadd_dim_reduction import CellPosterior
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 Array = np.ndarray
 CSR = sparse.csr_matrix
@@ -75,11 +86,12 @@ def build_targets(matrices: Sequence[ExpressionMatrix], memberships: Sequence[Me
         raise ValueError(f"{len(matrices)} matrices but {len(memberships)} memberships")
     names = list(population_names)
     rows = []
-    for m, memb in zip(matrices, memberships):
+    for exp, memb in zip(matrices, memberships):
         if list(memb.population_names) != names:
-            raise ValueError("population axes differ across days; align the columns before "
-                             "building targets")
-        M = memb.for_cells(m.cells)                              # (n_day, K), alignment checked
+            logger.info("population axes differ across days; proceeding to columns alignment before "
+                             "building targets")                       # K population alignment
+        ord_memb = memb.align_populations(names)
+        M = ord_memb.for_cells(exp.cells)                              # (n_day, K), alignment checked
         s = M.sum(1, keepdims=True)
         rows.append(np.divide(M, s, out=np.zeros_like(M), where=s > 0))   # labelled -> sum 1; else 0
     return np.vstack(rows)
@@ -221,8 +233,10 @@ def pretrain(model: GMVAENet, counts: CSR, epochs: int, batch_size: int, lr: flo
             loss, recon, kl = model.pretrain_loss(x, beta=beta)
             loss.backward()
             opt.step()
-            parts.append((float(loss.detach()), float(recon.detach()), float(kl.detach())))
-        row = np.mean(parts, axis=0)
+            # Keep the scalars on-device and sync once per epoch: reading a GPU scalar (float()/
+            # .item()/.cpu()) forces a host synchronisation, so doing it per batch stalls the loop.
+            parts.append(torch.stack((loss.detach(), recon.detach(), kl.detach())))
+        row = torch.stack(parts).mean(0).cpu().numpy()
         history.append(row)
         if verbose:
             print(f"[pretrain] epoch {epoch + 1}/{epochs}  "
@@ -260,9 +274,9 @@ def joint_train(model: GMVAENet, counts: CSR, targets: Array, class_weights: Arr
             loss = out.total_loss + lambda_sup * anchor
             loss.backward()
             opt.step()
-            parts.append((float(loss.detach()), float(out.total_loss.detach()),
-                          float(anchor.detach())))
-        row = np.mean(parts, axis=0)
+            # On-device accumulation, one host sync per epoch (see pretrain for the rationale).
+            parts.append(torch.stack((loss.detach(), out.total_loss.detach(), anchor.detach())))
+        row = torch.stack(parts).mean(0).cpu().numpy()
         history.append(row)
         if verbose:
             print(f"[joint] epoch {epoch + 1}/{epochs}  "
@@ -290,11 +304,12 @@ def seed_prior(model: GMVAENet, matrices: Sequence[ExpressionMatrix],
     embedder = VaDEEmbedder(model, device=device, batch_size=batch_size)
 
     mus, variances, weights = [], [], []
-    for m, memb in zip(matrices, memberships):
+    for exp, memb in zip(matrices, memberships):
         if list(memb.population_names) != names:
-            raise ValueError("population axes differ across days; align columns before seeding")
-        post = embedder.embed(m)                              # CellPosterior over this day's cells
-        weights.append(memb.for_cells(post.cells))            # (n_day, K), alignment checked
+            logger.info("population axes differ across days; align columns before seeding")
+        ord_memb = memb.align_populations(names)                  # population alignment checked
+        post = embedder.embed(exp)                                # CellPosterior over this day's cells
+        weights.append(ord_memb.for_cells(post.cells))            # (n_day, K), alignment checked
         mus.append(post.means)
         variances.append(post.variances)
 
@@ -330,5 +345,5 @@ def train(model: GMVAENet, matrices: Sequence[ExpressionMatrix],
     counts_per_pop = sum(np.asarray(memb.matrix).sum(0) for memb in memberships)   # (K,)
     cw = class_weights(counts_per_pop, class_weight_scheme)
     joint_hist = joint_train(model, counts, targets, cw, joint_epochs, batch_size,
-                             lambda_sup=lambda_sup, lr=lr, device=device, rng=rng, verbose=verbose)
+                             lambda_sup=lambda_sup, lr=lr, device=device, rng=rng, verbose=verbose)  # Stage B (GMM trained)
     return pre_hist, joint_hist

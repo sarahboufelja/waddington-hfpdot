@@ -29,6 +29,19 @@ from typing import Any, Iterator, List, Protocol, Sequence
 
 import numpy as np
 from scipy import sparse
+import logging
+
+from collections import Counter
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 Array = np.ndarray
 
@@ -475,6 +488,108 @@ class Membership:
             raise ValueError(f"cell {exc.args[0]!r} has no membership row") from exc
         return Membership(matrix=self.matrix[order], cells=cells,
                           population_names=list(self.population_names))
+
+    def align_populations(self, canonical_names: List[str]) -> Membership:
+        """Reorder COLUMNS to align exactly with the order in ``canonical_names``.
+
+        The column counterpart of ``reindex_to``: it makes the population axis canonical so
+        memberships from different days (which may list fates in any order, or omit fates absent that
+        day) share one comparable column layout.
+
+        Design contract:
+
+            - A population present in the input lands at its canonical index with its column intact.
+            - A canonical population absent from the input gets an all-zero column at its index.
+            - A population in the input but absent from ``canonical_names`` is a hard error: aligning
+              it away would silently drop labelled mass. Row sums are otherwise preserved exactly.
+            - Cells and ``CellAxis`` (ids and day) pass through untouched.
+        """
+        canonical = list(canonical_names)
+
+        dupes = [name for name, n in Counter(canonical).items() if n > 1]
+        if dupes:
+            raise ValueError(f"canonical_names has duplicate populations: {dupes[:5]}")
+
+        known = set(canonical)
+        unknown = [p for p in self.population_names if p not in known]
+        if unknown:
+            raise ValueError(
+                f"membership has populations absent from canonical_names: {unknown[:5]}; "
+                "aligning them away would drop labelled mass")
+
+        if canonical == list(self.population_names):
+            return self
+
+        source = {name: j for j, name in enumerate(self.population_names)}
+        ordered = np.zeros((self.matrix.shape[0], len(canonical)), dtype=self.matrix.dtype)
+        for out_j, name in enumerate(canonical):
+            src_j = source.get(name)
+            if src_j is not None:
+                ordered[:, out_j] = self.matrix[:, src_j]
+
+        return Membership(matrix=ordered, cells=self.cells, population_names=canonical)
+
+
+def read_cell_sets_gmt(path: Path | str) -> dict[str, List[str]]:
+    """Parse a GMT cell-set file into ``{population_name: [cell_id, ...]}``, preserving file order.
+
+    GMT is one population per line, tab-separated: ``name <tab> description <tab> id <tab> id ...``.
+    The description column (often ``-``) is ignored; the remaining fields are member cell ids. Blank
+    lines and lines without at least a name are skipped; a repeated population name is an error, since
+    it would make the fate axis ambiguous.
+
+    This file is the single source of truth for the canonical fate axis: the returned insertion order
+    is the canonical population order passed to ``membership_from_cell_sets`` and, downstream, to
+    ``Membership.align_populations``.
+    """
+    sets: dict[str, List[str]] = {}
+    with open(path) as fh:
+        for line in fh:
+            fields = line.rstrip("\n").split("\t")
+            name = fields[0].strip()
+            if not name:
+                continue                                   # blank line
+            if name in sets:
+                raise ValueError(f"population {name!r} appears on more than one line in {path!s}")
+            sets[name] = [cid for cid in fields[2:] if cid]
+    return sets
+
+
+def membership_from_cell_sets(cell_sets: dict[str, Sequence[str]], cells: CellAxis) -> Membership:
+    """Build one timepoint's ``Membership`` from a parsed GMT and that day's cell axis.
+
+    Columns are every fate in the GMT, in file order -- the canonical fate axis. Reordering to some
+    other target order is not this function's concern: call ``align_populations`` on the result.
+
+    The row axis is ``cells`` -- the ExpressionMatrix's ``CellAxis`` for this day -- so the result is
+    aligned to the counts by construction (same cells, same order): no reindex is needed and
+    ``build_targets``/``seed_prior`` accept it directly. Every one of those cells gets a row:
+
+    - a cell in no set gets an all-zero (unassigned) row -- the common case, especially early, where
+      it contributes only to the unsupervised ELBO and nothing to the supervised anchor;
+    - a cell listed under several fates (the ~5% overlap here) has unit mass split **equally** across
+      those fates, so the row sums to 1 and the ambiguity is a soft label rather than dropped or
+      double-counted. The equal split is not optional: the ``Membership`` invariant forbids rows that
+      sum above 1, so a multi-hot row could not be constructed in the first place.
+
+    A cell-set spans all days and both arms, so most of its ids belong to other timepoints (or the 2i
+    arm) and are simply absent from ``cells`` -- silently, since off-arm absence is expected every day
+    and arm selection is the reader's concern, not this function's.
+    """
+    names = list(cell_sets)
+    col_of = {name: j for j, name in enumerate(names)}
+    cols_for_cell: dict[str, List[int]] = {}
+    for name, members in cell_sets.items():
+        j = col_of[name]
+        for cid in members:
+            cols_for_cell.setdefault(cid, []).append(j)
+
+    M = np.zeros((len(cells), len(names)), dtype=np.float64)
+    for i, cid in enumerate(cells.ids):
+        cols = cols_for_cell.get(cid)
+        if cols:
+            M[i, cols] = 1.0 / len(cols)                   # equal split across the cell's fates
+    return Membership(matrix=M, cells=cells, population_names=names)
 
 
 def membership_from_labels(labels: Sequence[str], population_names: Sequence[str],
