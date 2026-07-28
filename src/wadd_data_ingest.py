@@ -335,7 +335,13 @@ class H5Reader:
         return keep
 
     def _read_one(self, path: Path) -> tuple[Any, list[str], list[str]]:
-        """Read one file as (sparse counts (cells, genes), cell ids, gene names).
+        """Read one file as (sparse counts (cells, genes), cell ids, gene ids).
+
+        The gene axis is keyed on the ``genes`` dataset -- the Ensembl ids (``ENSMUSG...``), which are
+        globally unique -- rather than ``gene_names`` (symbols), which collide (~56 duplicate symbols
+        in this mm10 reference, e.g. two distinct genes both called ``Rp1``). A unique key makes the
+        axis unambiguous to align and dedupe on; symbols are re-derivable from the file when a
+        human-readable interpretation layer needs them.
 
         The 10x HDF5 layout stores a CSC matrix genes-by-cells under ``/<genome>/``; we transpose to
         cells-by-genes and keep it sparse -- densifying here would cost ~780 MB per file for a real
@@ -349,10 +355,10 @@ class H5Reader:
             barcodes = group["barcodes"][:]
             matrix = sparse.csc_matrix((group["data"][:], group["indices"][:],
                                         group["indptr"][:]), shape=group["shape"][:])
-            genes = group["gene_names"][:]
+            gene_ids = group["genes"][:]                 # Ensembl ids: the unique gene-axis key
         counts = matrix.T.tocsr()                        # (cells, genes), still sparse
         cell_ids = [b.decode("utf-8") if isinstance(b, bytes) else str(b) for b in barcodes]
-        gene_names = [g.decode("utf-8") if isinstance(g, bytes) else str(g) for g in genes]
+        gene_names = [g.decode("utf-8") if isinstance(g, bytes) else str(g) for g in gene_ids]
         return counts, cell_ids, gene_names
 
     def _match_prefix(self, path: Path) -> re.Match | None:

@@ -445,19 +445,23 @@ def test_available_days_is_empty_for_an_empty_archive(tmp_path):
 import h5py                                   # a declared dev dependency: required, not optional
 
 
-def _write_10x(path, gene_names, barcodes, counts_genes_by_cells, genome="mm10"):
+def _write_10x(path, gene_ids, barcodes, counts_genes_by_cells, genome="mm10", symbols=None):
     """Write a minimal file in the 10x layout: a CSC matrix stored GENES-by-CELLS under /<genome>/.
 
-    Mirrors the real archive (byte-string barcodes and gene names, int32 shape), so tests exercise
-    the same decoding and orientation handling as the actual data.
+    Mirrors the real archive (byte-string barcodes, int32 shape, and BOTH gene datasets -- ``genes``
+    holding the unique Ensembl ids the reader keys the axis on, and ``gene_names`` the symbols), so
+    tests exercise the same decoding and orientation handling as the actual data. ``symbols`` defaults
+    to ``gene_ids`` when a test does not care to distinguish the two.
     """
     m = sparse.csc_matrix(np.asarray(counts_genes_by_cells, dtype=np.int32))
+    symbols = gene_ids if symbols is None else symbols
     with h5py.File(path, "w") as fh:
         g = fh.create_group(genome)
         g["data"], g["indices"], g["indptr"] = m.data, m.indices, m.indptr
         g["shape"] = np.array(m.shape, dtype=np.int32)
         g["barcodes"] = np.array([b.encode() for b in barcodes])
-        g["gene_names"] = np.array([n.encode() for n in gene_names])
+        g["genes"] = np.array([n.encode() for n in gene_ids])          # Ensembl ids: the axis key
+        g["gene_names"] = np.array([n.encode() for n in symbols])      # symbols (unused by the reader)
     return path
 
 
