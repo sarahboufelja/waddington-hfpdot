@@ -6,6 +6,7 @@ data/
 .vscode/
 assets/images/
 assets/gmvae_runs/
+*.log
 .pytest_cache/
 
 # uv / virtualenv
@@ -15,3 +16,4 @@ assets/gmvae_runs/
 docs/dev_timeline.md
 docs/math_audit.md
 docs/waddington_refactor_plan.md
+docs/gmvae_model.md
