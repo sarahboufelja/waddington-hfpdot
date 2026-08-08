@@ -35,19 +35,22 @@ import matplotlib.pyplot as plt
 import run_gmvae_train as R
 from gmvae.networks import GMVAENet
 from gmvae.embedder import VaDEEmbedder
-from wadd_dim_reduction import MomentMatchedGaussian, MonteCarloMixture, RandomSubsampler
+from wadd_dim_reduction import (MomentMatchedGaussian, MonteCarloMixture, ReverseMomentMatched,
+                                RandomSubsampler)
 from gmvae_confusion import latest_run
 
 
 _INK, _MUTED, _GRID, _LINE = "#1e293b", "#64748b", "#e2e8f0", "#2b6cb0"
+_ACCENT = "#b45309"
 
 
-def _plot_eta(days, eta, out):
-    """Single-series line: the identity-diversity radius over the reprogramming timecourse.
+def _plot_eta(days, eta, cap, out):
+    """The identity radius over the reprogramming timecourse, against its information ceiling.
 
-    One series -> no legend (the title names it), one hue, recessive grid/spines, thin 2px line with
-    small markers, the peak direct-labelled, a single y-axis. A light guide marks the Dox->serum
-    regime change (~D8.25), which is where the curve's sustained rise begins.
+    Two series only, so a legend plus direct labels: the radius itself (solid) and the ``log n`` cap
+    (dashed, a bound not a measurement -- it moves with the day's cell count). Recessive grid/spines,
+    thin 2px line, the peak direct-labelled, one y-axis. A light guide marks the Dox->serum regime
+    change (~D8.25).
     """
     fig, ax = plt.subplots(figsize=(9.5, 4.6))
     ax.set_axisbelow(True)
@@ -62,16 +65,70 @@ def _plot_eta(days, eta, out):
     ax.text(8.05, 0.97, "Dox → serum", color=_MUTED, fontsize=8, va="top", ha="right",
             transform=ax.get_xaxis_transform())            # x in data, y in axes fraction
 
+    ax.plot(days, cap, color=_MUTED, lw=1.6, ls=(0, (5, 3)), zorder=2)
     ax.plot(days, eta, color=_LINE, lw=2.0, marker="o", ms=4.5, mfc=_LINE, mec="white",
             mew=0.6, zorder=3)
+    ax.text(days[-1], cap[-1], "  ceiling  log n", color=_MUTED, fontsize=8.5, va="center")
+    ax.text(days[-1], eta[-1], r"  $\eta = I(\mathrm{cell};z)$", color=_LINE, fontsize=8.5,
+            va="center", fontweight="bold")
 
     ipk = int(np.argmax(eta))
     ax.annotate(f"peak  D{days[ipk]:g}", (days[ipk], eta[ipk]), textcoords="offset points",
                 xytext=(6, 8), fontsize=8.5, color=_INK, fontweight="bold")
 
+    ax.set_xlim(days[0] - 0.4, days[-1] + 2.6)                 # room for the direct labels
+    ax.set_ylim(bottom=0)
     ax.set_xlabel("day  (reprogramming timecourse)", color=_INK, fontsize=10)
-    ax.set_ylabel(r"diversity radius  $\eta$  (nats)", color=_INK, fontsize=10)
-    ax.set_title(r"Identity–diversity radius  $\eta(t)$  —  GSE122662 serum/Dox reprogramming",
+    ax.set_ylabel("identity radius  (nats)", color=_INK, fontsize=10)
+    ax.set_title(r"Identity radius  $\eta(t) = I(\mathrm{cell};\,z)$  —  GSE122662 serum/Dox "
+                 "reprogramming", color=_INK, fontsize=12, fontweight="bold", loc="left", pad=12)
+    fig.tight_layout()
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+
+
+def _plot_gap(days, gap, out, split=11.0):
+    """The multimodality gap KL(psi_bar || psi_0) over the timecourse.
+
+    This is the part of the moment-matched radius that carries biology: the mutual information
+    saturates at its log-n ceiling and so only tracks the day's cell count, leaving the departure of
+    the latent mixture from a single Gaussian as the quantity that moves with the landscape.
+
+    One series -> no legend. Regime means are drawn as short flat segments because the curve is a
+    step-and-plateau, not a monotone rise: stating that visually is more honest than a trend line.
+    """
+    fig, ax = plt.subplots(figsize=(9.5, 4.6))
+    ax.set_axisbelow(True)
+    ax.grid(True, color=_GRID, lw=0.8)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    for s in ("left", "bottom"):
+        ax.spines[s].set_color(_MUTED)
+    ax.tick_params(colors=_MUTED, labelsize=9)
+
+    ax.axvline(8.25, color=_MUTED, lw=1.0, ls=(0, (4, 3)), alpha=0.6, zorder=1)
+    ax.text(8.05, 0.05, "Dox → serum", color=_MUTED, fontsize=8, va="bottom", ha="right",
+            transform=ax.get_xaxis_transform())
+
+    early, late = days < split, days >= split
+    for mask, label in ((early, "early"), (late, "late")):
+        m = float(gap[mask].mean())
+        lo, hi = days[mask].min(), days[mask].max()
+        ax.plot([lo, hi], [m, m], color=_ACCENT, lw=1.6, ls=(0, (6, 3)), zorder=2)
+        ax.text(lo + 0.15, m - 0.6, f"{label} mean {m:.1f}", color=_ACCENT, fontsize=8.5,
+                ha="left", va="top", fontweight="bold")       # below the line, clear of the dashes
+
+    ax.plot(days, gap, color=_LINE, lw=2.0, marker="o", ms=4.5, mfc=_LINE, mec="white",
+            mew=0.6, zorder=3)
+
+    ipk = int(np.argmax(gap))
+    ax.annotate(f"D{days[ipk]:g}", (days[ipk], gap[ipk]), textcoords="offset points",
+                xytext=(0, 9), fontsize=8.5, color=_INK, fontweight="bold", ha="center")
+
+    ax.set_ylim(0, max(gap) * 1.18)
+    ax.set_xlabel("day  (reprogramming timecourse)", color=_INK, fontsize=10)
+    ax.set_ylabel(r"$\mathrm{KL}(\bar\psi\,\|\,\psi_0)$  (nats)", color=_INK, fontsize=10)
+    ax.set_title("Multimodality of the latent population  —  GSE122662 serum/Dox reprogramming",
                  color=_INK, fontsize=12, fontweight="bold", loc="left", pad=12)
     fig.tight_layout()
     fig.savefig(out, dpi=150)
@@ -94,32 +151,43 @@ def main(run_dir, days_spec=None, intensivity_days=(2.0, 9.0, 18.0)):
     model.load_state_dict(ckpt["model"]); model.to(device)
     embedder = VaDEEmbedder(model, device=device, batch_size=cfg.get("batch_size", 512))
 
-    mm, mc = MomentMatchedGaussian(), MonteCarloMixture(n_samples=2048, seed=0)
+    mm, mc, rev = MomentMatchedGaussian(), MonteCarloMixture(n_samples=2048, seed=0), \
+        ReverseMomentMatched()
 
     posts = {}                                              # day -> CellPosterior (kept for intensivity)
-    print(f"\n{'day':>6} {'n':>7} {'eta_mm':>10} {'eta_mc':>10} {'mc/mm':>7}")
+    print(f"\n{'day':>6} {'n':>7} {'MI (mc)':>9} {'bound(mm)':>10} {'gap':>8} {'log n':>7} "
+          f"{'MI/log n':>9} {'reverse':>10}")
     rows = []
     for exp in matrices:
         post = embedder.embed(exp)
-        e_mm, e_mc = mm(post), mc(post)
+        e_mm, e_mc, e_rev = mm(post), mc(post), rev(post)
+        cap = float(np.log(len(post)))
         posts[exp.day] = post
-        rows.append((exp.day, len(post), e_mm, e_mc))
-        print(f"{exp.day:>6} {len(post):>7} {e_mm:>10.3f} {e_mc:>10.3f} {e_mc / e_mm:>7.3f}")
+        rows.append((exp.day, len(post), e_mm, e_mc, e_mc - 0.0, e_mm - e_mc, cap, e_rev))
+        print(f"{exp.day:>6} {len(post):>7} {e_mc:>9.3f} {e_mm:>10.3f} {e_mm - e_mc:>8.3f} "
+              f"{cap:>7.3f} {e_mc / cap:>9.3f} {e_rev:>10.1f}")
 
-    ratios = np.array([r[3] / r[2] for r in rows])
-    print(f"\nmoment-matched vs MC: median mc/mm = {np.median(ratios):.3f}  "
-          f"[{ratios.min():.3f}, {ratios.max():.3f}]")
+    mi = np.array([r[3] for r in rows]); caps = np.array([r[6] for r in rows])
+    gaps = np.array([r[5] for r in rows])
+    print(f"\nMI (the radius):   median {np.median(mi):.3f} nats  [{mi.min():.3f}, {mi.max():.3f}]")
+    print(f"cap log n:         median {np.median(caps):.3f}      -> MI/cap median "
+          f"{np.median(mi / caps):.3f}  (max {np.max(mi / caps):.3f})")
+    print(f"Gaussianity gap:   median {np.median(gaps):.3f}      [{gaps.min():.3f}, {gaps.max():.3f}]"
+          f"   <- multimodality of the latent mixture")
+    print(f"retired reverse:   median {np.median([r[7] for r in rows]):.1f} nats (the artifact)")
 
     # persist the series (for later overlay against the propagated fate-uncertainty curve) + figure
-    day_arr = np.array([r[0] for r in rows]); n_arr = np.array([r[1] for r in rows])
-    mm_arr = np.array([r[2] for r in rows]); mc_arr = np.array([r[3] for r in rows])
-    order = np.argsort(day_arr)
-    day_arr, n_arr, mm_arr, mc_arr = day_arr[order], n_arr[order], mm_arr[order], mc_arr[order]
-    np.savez(run_dir / "eta_by_day.npz", day=day_arr, n=n_arr, eta_mm=mm_arr, eta_mc=mc_arr)
-    header = "day,n_cells,eta_moment_matched,eta_monte_carlo"
-    np.savetxt(run_dir / "eta_by_day.csv", np.c_[day_arr, n_arr, mm_arr, mc_arr],
-               delimiter=",", header=header, comments="", fmt=["%.2f", "%d", "%.4f", "%.4f"])
-    _plot_eta(day_arr, mm_arr, run_dir / "eta_by_day.png")
+    order = np.argsort([r[0] for r in rows])
+    day_arr = np.array([rows[i][0] for i in order]); n_arr = np.array([rows[i][1] for i in order])
+    mm_arr = np.array([rows[i][2] for i in order]); mc_arr = np.array([rows[i][3] for i in order])
+    cap_arr = np.array([rows[i][6] for i in order]); rev_arr = np.array([rows[i][7] for i in order])
+    np.savez(run_dir / "eta_by_day.npz", day=day_arr, n=n_arr, eta=mc_arr, eta_bound=mm_arr,
+             cap_log_n=cap_arr, gap=mm_arr - mc_arr, eta_reverse_retired=rev_arr)
+    header = "day,n_cells,eta_mutual_information,eta_moment_matched_bound,cap_log_n,gaussianity_gap"
+    np.savetxt(run_dir / "eta_by_day.csv",
+               np.c_[day_arr, n_arr, mc_arr, mm_arr, cap_arr, mm_arr - mc_arr], delimiter=",",
+               header=header, comments="", fmt=["%.2f", "%d", "%.4f", "%.4f", "%.4f", "%.4f"])
+    _plot_eta(day_arr, mc_arr, cap_arr, run_dir / "eta_by_day.png")
     print(f"series -> {run_dir/'eta_by_day.npz'} (+ .csv)   figure -> {run_dir/'eta_by_day.png'}")
 
     # (3) intensivity: eta on random subsamples vs the full population

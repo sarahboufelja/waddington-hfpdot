@@ -8,7 +8,7 @@ population membership use the categorical, instead of collapsing either to a poi
 Order of operations (deliberate):
 
     embed ALL cells   ->  CellPosterior{mu, sigma^2, prob_cat}
-    radii on ALL      ->  eta                      <- computed before any subsampling
+    radii on ALL      ->  eta = I(cell; latent)    <- computed before any subsampling
     subsample latent  ->  the transport budget
 
 The radii are computed on the full population because random subsampling biases ``eta`` **downward**
@@ -140,9 +140,12 @@ def _symmetrised_kl(mu_a: Array, var_a: Array, mu_b: Array, var_b: Array) -> Arr
 class RadiusEstimator(Protocol):
     """Estimates the uncertainty radius of a population of latent posteriors.
 
-    The radius is the mean divergence from the population's mixture to each individual cell,
-    ``eta = (1/n) sum_k KL(psi_0 || psi_k)`` with ``psi_0 = (1/n) sum_j psi_j`` -- a measure of how
-    diverse the population is, which is what sets how far the transport plan's marginals may wander.
+    The radius is the mean divergence of each individual cell to the population's mixture -- the forward KL
+    ``eta = (1/n) sum_k KL(psi_k || psi_0)`` with ``psi_0 = (1/n) sum_j psi_j``. The forward direction
+    allows the radius to have a clean information theoretical interpretation: it is the Mutual
+    Information between the latent representation and the uniform distribution over cells and measures
+    how many nats of cell identity the latent channel transmits -- the true cell uncertainty.
+    This eventually is what sets how far the transport plan's marginals may wander in the data space.
     """
 
     def __call__(self, posterior: CellPosterior) -> float: ...
@@ -157,21 +160,35 @@ class MomentMatchedGaussian:
         mu_bar    = mean_k(mu_k)
         Sigma_bar = mean_k(var_k)  +  var_k(mu_k)
                     \\____________/    \\_________/
-                    within-cell         between-cell
+                    within-cell (w)    between-cell (b)
 
-    after which every ``KL(N(mu_bar, Sigma_bar) || psi_k)`` is closed-form. Linear in the number of
+    after which every ``KL(psi_k || N(mu_bar, Sigma_bar))`` is closed-form. Linear in the number of
     cells and deterministic, so it carries none of the sampling noise of a Monte-Carlo estimate.
 
-    The approximation is exact when the cells are identical and degrades as the population becomes
-    strongly multimodal -- the mixture is then poorly described by one Gaussian. ``MonteCarloMixture``
-    is the reference to check it against.
+    Averaged over cells the two variance terms cancel **exactly** against each other, leaving only a
+    log-ratio -- the difference between the envelope's entropy and the mean component entropy:
+
+        (1/n) sum_k KL(psi_k || psi_0) = (1/2) sum_d [ log Sigma_bar_d - mean_k log var_{k,d} ]
+                                       = H(psi_0) - mean_k H(psi_k)
+                                      ~= (1/2) sum_d log(1 + b_d / w_d),
+
+    the last form holding when the per-cell variances are near-constant. That is the Shannon capacity
+    of a Gaussian channel carrying signal ``b_d`` through noise ``w_d``: the radius is **logarithmic**
+    in the identity signal-to-noise, so a sharper encoder raises it only gently.
+
+    Because a moment-matched Gaussian is the maximum-entropy distribution with those moments, this is
+    an **upper bound** on the mutual information -- exactly ``I(K;Z) + KL(psi_bar || psi_0)``, the
+    slack being the mixture's departure from Gaussianity. So it is not itself capped by ``log n``, and
+    it *overstates* a strongly multimodal population rather than understating it. The gap against
+    ``MonteCarloMixture`` (which estimates ``I`` itself) is therefore a multimodality diagnostic, not
+    estimator noise.
     """
 
     def __call__(self, posterior: CellPosterior) -> float:
         mu, var = posterior.means, posterior.variances
         mu_bar = mu.mean(axis=0)
         sigma_bar = var.mean(axis=0) + ((mu - mu_bar) ** 2).mean(axis=0)
-        return float(np.mean(_kl_diagonal_gaussians(mu_bar, sigma_bar, mu, var)))
+        return float(np.mean(_kl_diagonal_gaussians(mu, var, mu_bar, sigma_bar)))
 
 def _log_gaussian_all_pairs(x: Array, mu: Array, var: Array) -> Array:
     """log psi_j(x_s) for every sample s and component j -> (S, n). Diagonal Gaussians.
@@ -200,14 +217,22 @@ def _log_gaussian_all_pairs(x: Array, mu: Array, var: Array) -> Array:
 
 @dataclass(frozen=True)
 class MonteCarloMixture:
-    """Reference estimator: samples the mixture directly. O(n_samples * n), no Gaussian assumption.
+    """Reference estimator: the mutual information itself, sampled. O(n_samples * n).
 
-    Slower and noisier than the moment-matched form, but it makes no claim about the shape of the
-    mixture, so it is the yardstick for deciding when that claim is safe.
+    Makes no claim about the shape of the mixture, so it is the yardstick for deciding when the
+    moment-matched Gaussian claim is safe -- slower and noisier in exchange.
 
-    Draws ``n_samples`` cells uniformly, one latent sample each (which is exactly a draw from the
-    equal-weight mixture), then evaluates ``log psi_0(x) - (1/n) sum_k log psi_k(x)`` at those
-    points. The mixture density is evaluated against every component, so cost is O(n_samples * n).
+    Draws ``n_samples`` cells uniformly and one latent sample from each drawn cell, which realizes the
+    joint ``(K, Z)`` exactly, then averages the pointwise information
+
+        log psi_{k_s}(z_s) - log psi_bar(z_s),      psi_bar = (1/n) sum_j psi_j,
+
+    i.e. the log-ratio of the **drawn component's** density to the mixture density. Its expectation is
+    ``I(K; Z)``, capped by ``log n``. The mixture density needs every component at every sample, so
+    the cost is O(n_samples * n); individual terms may be negative even though the mean is not.
+
+    Note the contrast with ``ReverseMonteCarlo``, which reuses the very same samples and component
+    log-densities but averages ``mean_j log psi_j`` in place of the drawn component's ``log psi_k``.
     """
     n_samples: int = 2048
     seed: int = 0
@@ -218,23 +243,94 @@ class MonteCarloMixture:
         var = np.maximum(var, _VAR_FLOOR)
         rng = np.random.default_rng(self.seed)
 
-        which = rng.integers(0, n, size=self.n_samples)                       # pick components
-        x = mu[which] + rng.normal(size=(self.n_samples, q)) * np.sqrt(var[which])
+        which = rng.integers(0, n, size=self.n_samples)                       # pick components: K
+        x = mu[which] + rng.normal(size=(self.n_samples, q)) * np.sqrt(var[which])   # Z | K
 
         log_comp = _log_gaussian_all_pairs(x, mu, var)                        # Shape (n_samples, n)
-        log_mixture = _logsumexp(log_comp, axis=1) - np.log(n)                # log psi_0(x_s)
-        mean_log_component = log_comp.mean(axis=1)                            # (1/n) sum_k log psi_k
-        return float(np.mean(log_mixture - mean_log_component))
+        log_mixture = _logsumexp(log_comp, axis=1) - np.log(n)                # log psi_bar(z_s)
+        log_drawn = log_comp[np.arange(self.n_samples), which]                # log psi_{k_s}(z_s)
+        return float(np.mean(log_drawn - log_mixture))
 
 def _logsumexp(a: Array, axis: int) -> Array:
     peak = np.max(a, axis=axis, keepdims=True)
     return np.squeeze(peak, axis=axis) + np.log(np.sum(np.exp(a - peak), axis=axis))
 
 
+# -- retired: the reverse direction, kept as a diagnostic ------------------------------------------
+#
+# ``(1/n) sum_k KL(psi_0 || psi_k)`` reverses the arguments, and is NOT the mutual information of any
+# channel: it averages a *mean of log-densities* under the mixture, and since log(mean) != mean(log)
+# it never reassembles into ``KL(joint || product)``. Its dominant term is the Mahalanobis distance
+# ``(mu_k - mu_bar)^2 / var_k`` -- the population spread divided by the *narrow component* variance --
+# so it is LINEAR in the signal-to-noise ratio rather than logarithmic:
+#
+#     (1/n) sum_k KL(psi_0 || psi_k)  ~=  sum_d b_d / w_d,
+#
+# which on the trained embedding reaches ~1e3-1e4 nats and grows without bound as the encoder sharpens
+# (mode-seeking: it explodes wherever any single narrow component fails to cover mixture mass). Both
+# forms are retained only to quantify that artifact against the forward radius.
+
+@dataclass(frozen=True)
+class ReverseMomentMatched:
+    """Retired: reverse KL against the moment-matched envelope, ``(1/n) sum_k KL(psi_0 || psi_k)``."""
+
+    def __call__(self, posterior: CellPosterior) -> float:
+        mu, var = posterior.means, posterior.variances
+        mu_bar = mu.mean(axis=0)
+        sigma_bar = var.mean(axis=0) + ((mu - mu_bar) ** 2).mean(axis=0)
+        return float(np.mean(_kl_diagonal_gaussians(mu_bar, sigma_bar, mu, var)))
+
+
+@dataclass(frozen=True)
+class ReverseMonteCarlo:
+    """Retired: reverse KL by sampling, ``E_{psi_bar}[ log psi_bar - (1/n) sum_k log psi_k ]``."""
+    n_samples: int = 2048
+    seed: int = 0
+
+    def __call__(self, posterior: CellPosterior) -> float:
+        mu, var = posterior.means, posterior.variances
+        n, q = mu.shape
+        var = np.maximum(var, _VAR_FLOOR)
+        rng = np.random.default_rng(self.seed)
+
+        which = rng.integers(0, n, size=self.n_samples)
+        x = mu[which] + rng.normal(size=(self.n_samples, q)) * np.sqrt(var[which])
+
+        log_comp = _log_gaussian_all_pairs(x, mu, var)                        # Shape (n_samples, n)
+        log_mixture = _logsumexp(log_comp, axis=1) - np.log(n)                # log psi_bar(x_s)
+        mean_log_component = log_comp.mean(axis=1)                            # (1/n) sum_k log psi_k
+        return float(np.mean(log_mixture - mean_log_component))
+
+
 def uncertainty_radius(posterior: CellPosterior,
                        estimator: RadiusEstimator | None = None) -> float:
     """The population's uncertainty radius, computed on **all** cells given (see module docstring)."""
     return (estimator or MomentMatchedGaussian())(posterior)
+
+
+def gaussianity_gap(posterior: CellPosterior, n_samples: int = 2048, seed: int = 0) -> float:
+    """How far the latent mixture departs from a single Gaussian: ``KL(psi_bar || psi_0) >= 0``.
+
+    The two radius estimators differ by exactly this quantity. Splitting the forward KL through the
+    true mixture,
+
+        (1/n) sum_k KL(psi_k || psi_0) = (1/n) sum_k KL(psi_k || psi_bar) + KL(psi_bar || psi_0)
+              \\__ MomentMatchedGaussian __/     \\__ MonteCarloMixture = I(K;Z) __/
+
+    (the cross term collapses because ``(1/n) sum_k psi_k`` *is* ``psi_bar``), so the gap is the
+    moment-matched radius minus the Monte-Carlo one. Note the direction: it is the divergence **from**
+    the true mixture **to** its moment-matched envelope -- equivalently the excess entropy
+    ``H(psi_0) - H(psi_bar) >= 0``, non-negative because a moment-matched Gaussian is the
+    maximum-entropy distribution with those moments. The reverse ordering is a different quantity.
+
+    Zero for a genuinely Gaussian population and large when the population is multimodal, so it reads
+    as a structure diagnostic: how much of the moment-matched radius is real transmitted identity
+    versus the envelope over-covering the gaps between modes. Carries the Monte-Carlo estimator's
+    sampling noise, so small values are not meaningfully distinguishable from zero.
+    """
+    mm = MomentMatchedGaussian()(posterior)
+    mc = MonteCarloMixture(n_samples=n_samples, seed=seed)(posterior)
+    return float(mm - mc)
 
 
 # --------------------------------------------------------------------------------------------------

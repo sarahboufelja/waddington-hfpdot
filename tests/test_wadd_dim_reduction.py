@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from wadd_data_ingest import CellAxis  # noqa: E402
 from wadd_dim_reduction import (  # noqa: E402
     CellPosterior, MomentMatchedGaussian, MonteCarloMixture, uncertainty_radius,
+    ReverseMomentMatched, ReverseMonteCarlo, gaussianity_gap,
     RandomSubsampler, CoverageSubsampler,
 )
 
@@ -125,9 +126,15 @@ def test_moment_match_agrees_with_monte_carlo_on_a_unimodal_population():
     assert analytic == pytest.approx(reference, rel=0.25)
 
 
-def test_moment_match_understates_a_strongly_bimodal_population():
-    """The documented failure mode: one Gaussian cannot represent two separated modes, so the
-    approximation is optimistic. Pinned so the limitation stays visible rather than surprising."""
+def test_moment_match_overstates_a_strongly_bimodal_population():
+    """The documented failure mode: one Gaussian cannot represent two separated modes, so the envelope
+    is far too wide and the bound is loose. The moment-matched radius is exactly
+    ``I(K;Z) + KL(psi_bar || psi_0)``, so it OVERSTATES -- the gap measures non-Gaussianity, and is
+    the reason the Monte-Carlo reference is kept.
+
+    The reference itself is pinned near ``log 2``: the two modes are 40 apart while each component has
+    std ~0.22 against a within-mode spread of 0.1, so cells inside a mode are indistinguishable and the
+    latent resolves only *which* mode -- one bit of identity, whatever the number of cells."""
     rng = np.random.default_rng(5)
     n, q = 200, 2
     far = np.concatenate([rng.normal(-20, 0.1, size=(n // 2, q)),
@@ -135,7 +142,81 @@ def test_moment_match_understates_a_strongly_bimodal_population():
     p = _posterior(far, np.full((n, q), 0.05))
     analytic = MomentMatchedGaussian()(p)
     reference = MonteCarloMixture(n_samples=4000)(p)
-    assert analytic < reference
+    assert analytic > reference                                  # upper bound, loose off-Gaussian
+    assert reference == pytest.approx(np.log(2.0), abs=0.25)     # one bit: which mode
+
+
+def test_forward_radius_equals_the_gaussian_capacity_formula():
+    """The closed form, asserted exactly: with a constant per-cell variance the mean forward KL is
+
+        (1/n) sum_k KL(psi_k || psi_0) = (1/2) sum_d log(1 + b_d / w_d),
+
+    the Shannon capacity of a Gaussian channel carrying signal b_d (between-cell) through noise w_d
+    (within-cell). Exact, not asymptotic: the two variance terms of the KL cancel identically."""
+    rng = np.random.default_rng(11)
+    n, q = 300, 3
+    mu = rng.normal(size=(n, q))
+    b = mu.var(axis=0)                                          # between-cell variance per dim
+    for w in (1.0, 1e-2, 1e-4):
+        p = _posterior(mu, np.full((n, q), w))
+        assert MomentMatchedGaussian()(p) == pytest.approx(0.5 * np.sum(np.log(1.0 + b / w)))
+
+
+def test_forward_grows_logarithmically_where_reverse_grows_linearly():
+    """The property that motivates the forward direction, in the deep-SNR regime (b/w >> 1, so the
+    +1 of the capacity formula is negligible): sharpening the encoder 100x ADDS a fixed (q/2) log 100
+    nats to the forward radius, while it MULTIPLIES the retired reverse form by ~100."""
+    rng = np.random.default_rng(11)
+    n, q = 300, 3
+    mu = rng.normal(size=(n, q))
+    ws = (1e-2, 1e-4, 1e-6)
+    fwd = [MomentMatchedGaussian()(_posterior(mu, np.full((n, q), w))) for w in ws]
+    rev = [ReverseMomentMatched()(_posterior(mu, np.full((n, q), w))) for w in ws]
+
+    step = 0.5 * q * np.log(100.0)                              # the predicted additive increment
+    assert fwd[1] - fwd[0] == pytest.approx(step, rel=0.05)
+    assert fwd[2] - fwd[1] == pytest.approx(step, rel=0.05)
+    assert rev[1] / rev[0] == pytest.approx(100.0, rel=0.10)     # linear: multiplies, not adds
+    assert rev[2] / rev[1] == pytest.approx(100.0, rel=0.10)
+
+
+def test_mutual_information_is_capped_by_log_n():
+    """I(K; Z) <= H(K) = log n: with n cells the latent cannot resolve more than log n nats of
+    identity, however sharp the encoder. The moment-matched bound is NOT so capped (it carries the
+    Gaussianity gap on top), which is why the Monte-Carlo reference is the one to trust here."""
+    rng = np.random.default_rng(12)
+    n, q = 300, 3
+    p = _posterior(rng.normal(size=(n, q)), np.full((n, q), 1e-4))    # near-perfect resolution
+    mi = MonteCarloMixture(n_samples=4000)(p)
+    assert mi <= np.log(n) + 1e-6
+    assert mi == pytest.approx(np.log(n), rel=0.05)                   # saturates the cap
+    assert MomentMatchedGaussian()(p) > np.log(n)                     # the bound may exceed it
+
+
+def test_gaussianity_gap_separates_a_gaussian_population_from_a_bimodal_one():
+    """The gap KL(psi_bar || psi_0) is ~0 when the population really is one Gaussian, and large when
+    it is multimodal -- so it reads as a structure diagnostic on the moment-matched radius."""
+    rng = np.random.default_rng(13)
+    unimodal = _posterior(rng.normal(size=(400, 3)), np.full((400, 3), 1.0))
+    far = np.concatenate([rng.normal(-20, 0.1, size=(100, 2)), rng.normal(+20, 0.1, size=(100, 2))])
+    bimodal = _posterior(far, np.full((200, 2), 0.05))
+
+    assert gaussianity_gap(unimodal, n_samples=8000) == pytest.approx(0.0, abs=0.05)
+    assert gaussianity_gap(bimodal, n_samples=8000) > 5.0
+
+
+def test_gaussianity_gap_is_the_difference_of_the_two_estimators():
+    rng = np.random.default_rng(14)
+    p = _posterior(rng.normal(size=(120, 3)), rng.uniform(0.5, 1.5, size=(120, 3)))
+    expected = MomentMatchedGaussian()(p) - MonteCarloMixture(n_samples=3000, seed=0)(p)
+    assert gaussianity_gap(p, n_samples=3000, seed=0) == pytest.approx(expected)
+
+
+def test_reverse_estimators_are_kept_and_agree_with_each_other():
+    """The retired direction stays available as a diagnostic; its two forms must still track."""
+    rng = np.random.default_rng(15)
+    p = _posterior(rng.normal(size=(200, 3)), rng.uniform(0.8, 1.2, size=(200, 3)))
+    assert ReverseMomentMatched()(p) == pytest.approx(ReverseMonteCarlo(n_samples=6000)(p), rel=0.25)
 
 
 def test_monte_carlo_estimator_is_reproducible():

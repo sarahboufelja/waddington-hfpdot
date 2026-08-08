@@ -329,7 +329,99 @@ and freezes the subspace — hence samples strength UQ only.
 The core-only exponential retraction is **inadmissible** for full-manifold UQ. We ship **B**
 first (does it move eBFMI at all?), and investigate **C** as the rigorous next step.
 
-## 4. Matrix-free determinant (the scaling crux) — TODO
+## 4. The identity radius `η`: KL direction, mutual information, and the latent→marginal map
+
+The HFPD-OT hyperprior (paper §3, Eqs 15–16) is conditioned on **marginal KL-ball radii** `(η, ζ)` —
+the prior-elicited degree of uncertainty on the source/target marginals — from which the Kantorovich
+potentials `λ(η)` follow (see `src/wadd_potential.py`). In HierWOT these radii are *not* hand-elicited:
+they are derived from the identity uncertainty the GMVAE posterior already exposes (single-source
+principle). This section fixes the **direction convention** of the radius KL — which turns out to
+decide both its magnitude and its meaning — and the invariants the map to the marginal radius must
+satisfy. The map's functional form is deliberately left open here.
+
+Setup: cell `k` has diagonal-Gaussian latent posterior `ψ_k = N(μ_k, σ²_k)` on `ℝ^q`. Per dim `d`,
+write the mean **within**-cell variance `w_d = E_k[σ²_{k,d}]` (encoder localisation noise) and the
+**between**-cell variance `b_d = Var_k[μ_{k,d}]` (population heterogeneity, carried by the mean map);
+the moment-matched envelope is `ψ₀ = N(μ̄, Σ̄)` with `Σ̄_d = w_d + b_d` (law of total variance). The
+SNR per dim is `r_d ≡ b_d / w_d`.
+
+### 4.1 The reverse direction (mixture → component) is a precision-amplified artifact
+
+The initially implemented radius was the **reverse** mean KL,
+
+    η_rev = (1/n) Σ_k KL(ψ₀ ‖ ψ_k)  ≈  Σ_d r_d − ½ Σ_d log(1 + r_d)  ≈  Σ_d b_d / w_d.       (‡)
+
+Its dominant term is the Mahalanobis distance `(μ_k−μ̄)²/σ²_k`: the population spread scaled by the
+**narrow component** variance. It is therefore *linear* in the SNR — on the trained GSE122662
+embedding (`q = 10`, module 3b) `r_d ≈ 10²–10³` per dim gives `η_rev ≈ 1.2·10³–9.8·10³` — and it grows
+without bound as the encoder gets more confident. Structurally, `η_rev = E_{ψ̄}[log ψ̄ − mean_k log
+ψ_k]` is an expectation of a *mean of log-densities* under the marginal: since `log(mean) ≠
+mean(log)`, it never reassembles into `KL(joint ‖ product)` — **it is not the mutual information of
+any channel**, has no information-theoretic reading, and is mode-seeking (it blows up wherever any
+single narrow component fails to cover mixture mass). The huge magnitude and the counter-intuitive
+confidence-dependence are the same defect seen from two sides.
+
+### 4.2 The forward direction (component → mixture) IS the mutual information
+
+Build the honest joint space behind the mixture: `K ~ Unif{1..n}` (pick a cell), `Z | K=k ~ ψ_k`, so
+the marginal of `Z` is the true mixture `ψ̄ = (1/n) Σ_k ψ_k`. By definition,
+
+    I(K; Z) = KL( p(k,z) ‖ p(k) p(z) ) = E_k [ E_{z~ψ_k} log( ψ_k(z) / ψ̄(z) ) ]
+            = (1/n) Σ_k KL(ψ_k ‖ ψ̄).
+
+The outer expectation in MI is under the **joint**, i.e. under the *conditional* `ψ_k` — so the
+conditional must occupy the first (averaging) slot of the KL and the mixture the second. The direction
+is **forced** by `I = KL(joint ‖ product)`, not a convention choice. (Equivalently: this is the
+generalized Jensen–Shannon divergence of the components with uniform weights.) `η_fwd ≡ I(K;Z)` is
+"how many nats of cell identity the latent channel transmits" — the correct *identity* uncertainty.
+
+Against the moment-matched envelope the forward average is **exact** (no leading-order step; the
+variance terms cancel identically, up to `E[log σ²] ≈ log w`):
+
+    (1/n) Σ_k KL(ψ_k ‖ ψ₀) = ½ Σ_d log(1 + b_d / w_d),                                          (§)
+
+which is the **Shannon capacity of a Gaussian channel** per dim — signal `b_d`, noise `w_d`. The
+log-scaling of the radius is thus a theorem, not a design preference: more encoder resolution does
+transmit more identity, but at the information scale (logarithmic), not the reverse direction's
+linear blow-up.
+
+### 4.3 Two convention caveats (both load-bearing)
+
+1. **Envelope vs true mixture.** Exactly: `(1/n) Σ_k KL(ψ_k ‖ ψ₀) = I(K;Z) + KL(ψ̄ ‖ ψ₀)`. The
+   moment-matched forward radius (§) is MI **plus a non-negative Gaussianity gap** (zero iff the
+   mixture is Gaussian) — a variational upper bound on MI. The Monte-Carlo estimator, which evaluates
+   the true mixture, estimates `I` itself; the MM-vs-MC discrepancy is therefore the **multimodality
+   diagnostic**, not mere estimator noise.
+2. **The `log n` cap.** `I(K;Z) ≤ H(K) = log n` (≈ 8.9 at 7k cells/timepoint). A back-of-envelope
+   `(§) ≈ ½·10·log(10²…10³) ≈ 23–35` nats exceeds that cap — consistent, because (§) includes the
+   Gaussianity gap (real populations are clustered, far from one Gaussian). On real data expect:
+   exact MI ≤ log n; the (§) bound above it. Both are `O(10)`, log-scale.
+
+### 4.4 The two ranges and what they force on the map `η ↦ ρ`
+
+| | quantity | range | character |
+|---|---|---|---|
+| latent (forward) | `η_fwd = I(K;Z)`, MM bound (§) | `[0, log n]` exactly; MM bound `O(10)` | identity information, log-scale in SNR |
+| latent (reverse, retired) | `η_rev ≈ Σ_d b_d/w_d` (‡) | `[0, ∞)` | linear in SNR, confidence-amplified; kept only as a diagnostic |
+| marginal | `ρ = KL(μ‖μ₀)` on the `m`-cell simplex (`m ≈ 500`) | `[0, ρ_max]`, `ρ_max ≈ log m ≈ 6.2` (near-uniform `μ₀`; `−log min μ₀` if skewed) | bounded simplex KL; sensible band `ρ ≲ 1–2` |
+
+With the forward radius both spaces are bounded and log-scale, so the map is a **smooth adjustment,
+not a harsh projection**. The invariants an admissible map must satisfy (paper Remark 1 asymptotics):
+
+- **monotone increasing** — more transmitted identity ⇒ looser marginal ball;
+- `η_fwd → 0` ⇒ `ρ → 0` (indistinguishable cells → marginals pinned to `μ₀`, `λ → ∞`, deterministic
+  EOT recovered);
+- `η_fwd` at its cap ⇒ `ρ → ρ_max` without overshoot (`λ → 0`, marginals free);
+- dimensional consistency: both sides in nats, and the latent side normalised (per-dim or relative to
+  its cap) rather than raw;
+- intensive: per-timepoint, invariant to cell count `n` beyond the `log n` cap.
+
+The specific form is under evaluation against these invariants; candidates are compared in the
+module-6a work, not fixed here.
+
+---
+
+## 5. Matrix-free determinant (the scaling crux) — TODO
 
 Stub. To cover: exact `log det G` is `O(min(II,JJ)³ r³)/step` → defeats scaling; never form
 `G`, only `G·v` at `O(II·JJ·r)`; `log det G` via stochastic Lanczos quadrature; `∇ log det G
