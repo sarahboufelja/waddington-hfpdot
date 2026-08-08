@@ -536,6 +536,34 @@ class Membership:
         return Membership(matrix=ordered, cells=self.cells, population_names=canonical)
 
 
+def read_fle_coords(path: Path | str) -> dict[str, tuple[float, float]]:
+    """Parse a published force-directed layout as ``{cell_id: (x, y)}``.
+
+    Tab-separated with an ``id``/``x``/``y`` header -- the format of the Waddington-OT coordinate
+    release. Using those coordinates rather than a layout computed from our own latent space puts our
+    results on the axis readers already know, so the comparison is about the uncertainty we add and
+    not about a changed embedding; a layout built from our latent stays available as a diagnostic.
+
+    Two caveats travel with the file. It covers the whole archive including arms we exclude, so ids
+    absent from a given day's ``ExpressionMatrix`` are simply unused; and it omits cells that the
+    published pipeline filtered in quality control (~3% of our in-scope cells), so plotting on this
+    axis silently adopts that curation. Callers should report how many cells they could not place.
+    """
+    coords: dict[str, tuple[float, float]] = {}
+    with open(path) as fh:
+        header = fh.readline().rstrip("\n").split("\t")
+        try:
+            i_id, i_x, i_y = header.index("id"), header.index("x"), header.index("y")
+        except ValueError as exc:
+            raise ValueError(f"{path!s}: expected id/x/y columns, got {header}") from exc
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            if len(f) <= max(i_id, i_x, i_y) or not f[i_id]:
+                continue
+            coords[f[i_id]] = (float(f[i_x]), float(f[i_y]))
+    return coords
+
+
 def read_cell_sets_gmt(path: Path | str) -> dict[str, List[str]]:
     """Parse a GMT cell-set file into ``{population_name: [cell_id, ...]}``, preserving file order.
 
