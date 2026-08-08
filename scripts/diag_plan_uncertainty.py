@@ -32,12 +32,14 @@ import os
 import sys
 from pathlib import Path
 
-# Pin JAX to CPU with one host device per chain, BEFORE anything imports jax. On a multi-GPU box JAX
-# otherwise claims both devices and the sampler's per-chain vmap turns into a multi-device collective,
-# which fails outright (NCCL ncclAlltoAll ... unhandled system error). The GMVAE embedding below still
-# uses CUDA through torch; only the sampler is pinned.
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
-os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
+# These MUST be set before anything imports jax, and that is easy to get wrong here: langevin_sampler
+# sets them itself at its own line 6, but `import ot` (POT probes for a jax backend at import time)
+# pulls jax in first, so by the time the sampler module is reached jax has already initialised and the
+# flags are inert. The symptom is a hard failure inside the chain sharding
+# (NCCL ncclAlltoAll ... unhandled system error), not a graceful fallback. Keeping them here preserves
+# the sampler's design: chains are sharded across BOTH GPUs via NamedSharding on a ("chains",) mesh.
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
