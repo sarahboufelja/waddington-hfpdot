@@ -541,3 +541,104 @@ Intermittent chain freezing = the hard-gauge stiffness biting individual chains;
 degradation with dimension = the same stiffness worsening as `m` grows. Both point to the same
 fix: **Option C's well-conditioned symmetric geometry**. Methodology going forward: **eBFMI
 median + per-chain spread + frozen-chain count**, not `eBFMI_min`.
+
+---
+
+## E11 — the gauge ridge: root cause of the convergence ceiling, confirmed at production scale
+*Date: 2026-08-09 · branch: `feature/derive_volume_term`*
+
+### Background — factorial attribution first
+Every prior comparison confounded target factors. A 2×2×2 factorial (`scripts/diag_sampler_factorial.py`;
+cost ∈ {real GaussianW2, E9 synthetic iid} × λ ∈ {1/0.01, 10/0.5} × Gibbs sharpness
+`s = (C_max−C_min)/ε` ∈ {3.3, 33}; N=30, orthant, ridge r=2, bridge config) attributed the
+real-target degradation:
+- **λ-strength dominates**: warm-start `ev_max ∝ λ`; κ jumps 40–70× into the 10⁴–10⁵ range at
+  λ≈10–30 — exactly the regime `λ(η)` produces for tight-marginal days. ESS drops 3–4×.
+- **Cost structure is secondary** (≤2×, mostly by amplifying κ under strong λ). The E9 synthetic
+  cost is concentration-flattened (contrast 0.90 vs real 3.32) — an intrinsically easy target.
+- **Sharpness helps monotonically** (s=3.3→33→90 improves every pairing); the E-series' literal
+  ε=0.01 sat at s≈90, its easiest corner.
+- ε is not a standalone factor: it acts only through `s` (running ε=0.01 on the real cost puts
+  337 nats in the exponent and overflows).
+
+### The root cause
+`κ(λ_I)` co-scaling made conditioning *worse* → the soft block is flat under **both** potential
+terms → it is the **GL(r) gauge of the factor parametrisation**, unpenalised because
+`ridge = 0.0` in every recorded run (E-series included; E3's caveat had flagged an unfixed gauge
+for the *section* variant only). Consequences: exact flat directions, saddle warm start (46/120
+non-positive Hessian directions at N=30), unbounded gauge diffusion during the unadapted warm-up
+corrupting the frozen mass matrix — the universal never-strictly-converged ceiling. The ridge is
+also the propriety fix: without it `S^o` is improper on the chart; with it, `−ridge·‖θ‖²` is a
+proper Gaussian prior on the correction amplitude (scale to be ratified; π-bias to be quantified).
+
+κ at the warm start (N=30, real cost, λ=10, s=33): ridge 0 → 12,324 (46 dirs ≤0);
+0.1 → 105 (0 dirs ≤0); 0.5 → 8.9.
+
+### Results — mixing follows κ
+N=30 (real cost, strong-λ, orthant, bridge config):
+| ridge | κ | R̂_med | R̂_max | ESS_med | ESS_min | eBFMI_min |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.0 | 12,324 | 1.62 | 2.65 | 251 | 12 | 0.164 |
+| 0.1 | 105 | 1.08 | 1.40 | 459 | 24 | 0.058 |
+| 0.5 | 8.9 | **1.01** | **1.10** | 810 | 143 | 0.212 |
+
+**N=500 — the production gate** (250k-dim plans, m=2000, `max_pi_coords=2000`; ~2.3 min/run GPU):
+| ridge | R̂_med | R̂_max | ESS_med | ESS_min | eBFMI_min |
+|---|---:|---:|---:|---:|---:|
+| 0.0 | 1.76 | 2.94 | 192 | 13 | 0.211 |
+| 0.1 | 1.15 | 1.84 | 224 | 20 | 0.029 |
+| 0.5 | **1.02** | **1.14** | 347 | 52 | 0.085 |
+
+**Reproduce:** `python scripts/experiments/e11_ridge_scale.py --budget 500 --skip-hessian`
+(the warm-start Hessian at m=2000 OOMs through the π-space intermediates; matrix-free Lanczos is
+the follow-up for spectra at scale).
+
+### Findings / decision
+1. **The convergence ceiling was the unpenalised gauge, not MALA, not the chart family.** The
+   ridge=0 control at N=500 reproduces the historical ceiling (R̂_med 1.76); ridge=0.5 reaches
+   R̂_med 1.02 **on the real production-regime target** — beyond every synthetic-era result.
+2. Honest residuals: eBFMI 0.085 at N=500/ridge 0.5 — energy exploration is now the weak spot
+   (→ warm-up machinery: adapt-in-warm-up/freeze-for-sampling, post-transient mass window, step
+   clamp; and ESJD-aware adaptation). ESS_med 347 vs 810 at N=30 — mild N-degradation, curable
+   with draws. Claim precisely: *approximately converged, R̂-clean; energy mixing to harden*.
+3. `ridge > 0` is **mandatory** in all future runs; scale selection + π-bias quantification is
+   the open modelling item (κ(λ, ridge) is the object of the condition-number derivation).
+4. The dual-potential reparametrisation is demoted from "the fix" to the scaling-optimisation
+   track.
+
+## E12 — ridge-scale ratification R2: bias grid at production scale
+
+**Question.** How much does the gauge-breaking ridge move the published observables, and can the
+gamma -> 0 limit be recovered? Grid gamma in {0.4, 0.6, 0.8, 1.2, 2.0} x {Dox D2->2.5, Serum
+D12->12.5} at N=500 (bridge config x2 draws, 4 chains, thinned chart pushforward of 500
+draws/chain). Observables per draw: K x K transition table (W = GMVAE posterior responsibilities
+q(c|z), single-source; Schiebinger annotations cover 0% of cells before D6), R_mu/R_nu =
+gKL(marginals || priors), Gibbs divergence gKL(pi || pi_I), tilt statistic T = ||theta||^2.
+
+**Method.** Exponential-tilt identity d E_gamma[O]/d gamma = -Cov_gamma(O, T) validated against
+finite differences (agreement 0.97-1.10 on all scalar segments, both phases); mean curves
+near-linear in gamma, so Ehat_0[O] is taken as the quadratic-LS intercept at gamma = 0 (an
+extrapolant -- the gamma = 0 chart target is improper, no chain exists there). For weakly
+coupled observables (table cells) the Cov route is noise-dominated (overstates bias ~8x); the
+certificate uses the grid extrapolation. Scripts: `e12_ridge_bias_grid.py` (record, incremental
+per-cell checkpoint) + `e12_ridge_bias_report.py` (certificate tables + 4-panel figure).
+
+**Certificate at gamma* = 0.40 (strengthened, threshold-free form).**
+1. Location: |bias|/sd med 0.107 / max 0.231, |bias|/band max 0.058 (serum, 89/169 live cells;
+   annotation-W baseline). Coverage-budget restatement: a shift of b sd erodes nominal 95%
+   coverage by ~0.115 b^2 -- measured med 0.07pp / max 0.45pp against a 0.7pp budget.
+2. Dual-column stability: correction is not decisive (extrapolation error ~ bias); BOTH columns
+   reported and all qualitative claims invariant (Spearman 0.9998, max rank shift 1, zero rows
+   change dominant destination).
+3. Width NOT certified from within the family: table sd shrinks ~gamma^-0.59 with no visible
+   plateau -- the small-N gold anchor (R2 step 3) is the width calibrator.
+4. Structural root of the R_mu blow-up: the chart origin theta = 0 maps to the bare Gibbs kernel
+   exp(-C/eps), not the Sinkhorn plan, so the ridge shrinks toward a marginal-violating plan
+   (E[R_mu] rises ~36-40 nats per unit gamma). lambda(eta) must be solved under the ridged
+   scheme; a centered ridge gamma ||theta - theta_0||^2 (shrink toward the warm start = exact
+   rank-2 Sinkhorn factorisation) is the candidate fix -- it requires a re-determination of
+   gamma* and is evaluated before the production campaign.
+
+**Reproduce:** `python scripts/experiments/e12_ridge_bias_grid.py --budget 500` then
+`python scripts/experiments/e12_ridge_bias_report.py`. Staging embeds on CPU (the jax pool must
+not compete with torch for device memory on shared boxes).
