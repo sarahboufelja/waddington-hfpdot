@@ -409,15 +409,119 @@ With the forward radius both spaces are bounded and log-scale, so the map is a *
 not a harsh projection**. The invariants an admissible map must satisfy (paper Remark 1 asymptotics):
 
 - **monotone increasing** — more transmitted identity ⇒ looser marginal ball;
-- `η_fwd → 0` ⇒ `ρ → 0` (indistinguishable cells → marginals pinned to `μ₀`, `λ → ∞`, deterministic
-  EOT recovered);
+- `η_fwd → 0` ⇒ `ρ → 0` (indistinguishable cells → marginals pinned to `μ₀`, `λ → ∞`). NB: pinning
+  the **marginals** does not pin the **plan**: as `η → 0` the hyperprior degenerates onto the
+  transport polytope `Π(μ₀, ν₀)` — a set of dimension `~m²−2m+1`, not a point (paper Remark 1,
+  Eq 26) — over which `S^o` stays spread at the temperature of the `KL(π‖π_I)` term. Deterministic
+  EOT is *not* recovered in the limit; coupling uncertainty survives exactly-known marginals;
 - `η_fwd` at its cap ⇒ `ρ → ρ_max` without overshoot (`λ → 0`, marginals free);
 - dimensional consistency: both sides in nats, and the latent side normalised (per-dim or relative to
   its cap) rather than raw;
 - intensive: per-timepoint, invariant to cell count `n` beyond the `log n` cap.
 
-The specific form is under evaluation against these invariants; candidates are compared in the
-module-6a work, not fixed here.
+The specific form is fixed in §4.5: the latent Gaussian radius of this section is superseded by the
+fate-channel radius `η = H(π̄)`, which passes every invariant above on the real embedding.
+
+### 4.5 The adopted radius: `η = H(π̄)` on the fate channel
+
+§§4.1–4.4 diagnosed the *latent-Gaussian* channel: its forward KL is the MI of the cell-index
+channel, `I(cell; z) ≤ log n` — and on the real embedding it **saturates that cap at every timepoint**
+(`MI/log n ∈ [0.982, 1.000]`), measuring only the day's cell count. The fix is not a new direction
+convention but a new output alphabet: the **fate channel**, whose outcomes are the `K` mixture
+components rather than the `n` cell indices.
+
+**Setup.** The embedder evaluates responsibilities at the deterministic posterior mean, `p_i =
+q(c | μ̃(x_i)) ∈ Δ^{K−1}`. The day defines a finite two-stage experiment: `I ~ Unif{1..n}`,
+`C | I=i ~ p_i`, with joint `P(i,a) = p_{ia}/n` on `{1..n}×{1..K}`. Its `C`-marginal is exactly the
+day's soft fate composition,
+
+    π̄ = (1/n) Σ_i p_i .
+
+A mixture of categoricals is itself categorical, so the envelope-vs-mixture split of §4.3.1 cannot
+arise: **no Gaussianity gap exists on this channel**, and everything below is exact in closed form.
+
+**Two exact identities.** With the direction forced by `I = KL(joint ‖ product)` (§4.2),
+
+    I(C;I) = (1/n) Σ_i KL(p_i ‖ π̄) = H(π̄) − (1/n) Σ_i H(p_i),
+
+the second equality by expanding the log-ratio and swapping the two finite sums. Because `C` depends
+on `I` only through the deterministic embedding `μ̃`, the data-processing inequality holds in both
+directions and `I(C;I) = I(C; Z̃)` exactly, `Z̃ = μ̃(X)`. Rearranged, the chain rule:
+
+    H(π̄) = I(C; Z̃) + E_i H(p_i)
+          = resolved identity spread + residual per-cell ambiguity.                            (¶)
+
+**Definition.** The identity radius of a timepoint is the entropy of its fate composition,
+
+    η ≡ H(π̄),   0 ≤ η ≤ log K = log 13 ≈ 2.565.
+
+By (¶) it is the *complete* account of the latent identity uncertainty: either summand alone tells
+half the story. `I(C;Z̃)` is high when the population is confidently spread over distinct fates;
+`E_i H(p_i)` is high when individual cells are ambiguous. Both grant the day's marginal the same
+freedom, and `η` counts both. The two extreme microstates — `K` confidently occupied fates versus
+uniformly ambiguous cells — share `η = log K` with opposite splits of (¶); the decomposition is
+always reported alongside `η` so they remain distinguishable.
+
+**Endpoints, exactly (not asymptotically).**
+
+- `η = 0` ⟺ every cell confidently in the *same* fate (homogeneous day) ⟹ `ρ → 0`, marginals
+  pinned to the prior.
+- **Pinned marginals do not pin the plan**: at `η → 0` the hyperprior degenerates onto the transport
+  polytope `Π(μ₀, ν₀)` — dimension `~m²−2m+1`, a set, not a point (paper Remark 1, Eq 26) — with
+  `S^o` still spread over it at the temperature of `KL(π‖π_I)`. Coupling uncertainty survives
+  exactly-known marginals; this is a theoretical and practical point of the model, not a corner case.
+- `η = log K` at either maximal microstate; the cap is attained, never exceeded.
+
+**Checklist (§4.4), measured on the real embedding** (39 days, GSE122662):
+
+| invariant | verdict |
+|---|---|
+| bounded, log-scale | `η ∈ [0.012, 1.851]` ≤ `log 13`; `K_eff = e^η` from 1.0 to 6.4 |
+| intensive | `π̄` is a mean over cells ⇒ dependence on `n` only through `O(n^{-1/2})` plug-in error; subsample ratio flat (0.94–1.02, m = 50…2000) |
+| trajectory | corr(day) ≈ +0.94; silent Dox phase (`K_eff ≈ 1`), takeoff at the Dox→serum switch, `K_eff → 6.4` at D18 (= 4.66 coarse × 1.37 within-branch; see caveat 3) |
+| endpoint `η→0 ⇒ ρ→0` | exact (homogeneous day), with the polytope caveat above |
+| dimensional consistency | nats on both sides; constant normaliser `log K` |
+
+**The retired candidate** `η_boot = E_b KL(μ^(b) ‖ μ₀)` (resample each cell's fate from `p_i`, KL of
+the drawn composition against the point estimate) fails the checklist measurably: it is the
+**standard error of the composition**, `η_boot ≈ ½ Σ_a Var_b(μ_a)/μ₀_a = O(1/n)` (measured:
+`n·η_boot ≈ const` across all 39 days; subsample ratio 25× at m = 50), and it *inverts*
+monotonicity — one-hot cells give 0, uniform cells give the sampling null `(K−1)/2n`. It is kept
+only as the model's own finite-sample noise floor, the in-model analog of the replicate-lane
+measurement.
+
+**The map to the data-space marginal simplex.** The §4.4 endpoints with the *constant* normaliser
+(the day's own value cannot normalise itself) force
+
+    ρ = log(m) · η / log(K),      ρ(0) = 0,   ρ(log K) = log m,
+
+no overshoot; at `m = 500`, `ρ_max = log 500 ≈ 6.215` and the measured median is `ρ ≈ 1.4` — inside
+the sensible band of the §4.4 table. Equivalently `ρ = log(m) · log(K_eff)/log(K)`.
+
+**Caveats.**
+
+1. *Calibration:* `p_i` is evaluated at the posterior mean (the embedder's deterministic contract),
+   which ignores within-cell encoder noise in the fate readout; a cell whose latent posterior
+   straddles a component boundary has its ambiguity understated, biasing `η` toward the resolved
+   side. The replicate lanes remain the external check; a sampled-`z` recomputation of `p_i` is the
+   cheap in-model robustness test.
+2. *Plug-in error:* the population functional is estimated with the day's `n` cells; fluctuation
+   `O(n^{-1/2})`, visible as the ±6% wiggle at m = 50–100 in the intensivity curve.
+3. `η` inherits the GMVAE's granularity, and the grouping identity for entropy makes the
+   inheritance exact. With coarse groups `g` (the 6-node level of the fate tree) and lumped masses
+   `π̄_g`,
+
+       H(π̄_13) = H(π̄_coarse) + Σ_g π̄_g H(children | g),
+
+   so switching the support from 13 to 6 fates changes `η` by exactly the within-branch term.
+   Measured on the real embedding: the within-branch term is **identically 0 until D12** (the
+   Neural/Trophoblast subtrees carry no mass before subtype diversification) and at most
+   `log 1.37 ≈ 0.31` nats (~17% of `η`) at D18. Equivalently `K_eff` factorises: at D18,
+   `6.37 = 4.66 (coarse) × 1.37 (within)` — the numerical proximity of `K_eff(D18)` to the number
+   of coarse fates is a coincidence, not structure; the coarse composition there is uneven
+   (5 groups occupied: Stromal .33, Epithelial .25, Neural .22, IPS .11, Trophoblast .09). The
+   6-vs-13 decision therefore has a bounded, day-resolved price on `η`, entirely concentrated in
+   the late timecourse.
 
 ---
 
