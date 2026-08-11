@@ -265,13 +265,22 @@ class MetropolisAdjustedLangevinSampler:
         else:
             constrained_samples = self.support.to_constrained(latent_samples)   # (C, D, II*JJ)
 
-        # Compute diagnostic metrics in the transformed spaces (pi-space)
-        # Convergence diagnostics operate on the latent sampling space, per chain.
-        # eBFMI needs the log-prob, so we pass it to the diagnostics object; R-hat/ESS are gauge-invariant on pi, so we don't need a log-prob for that.
-        self._diagnostics = MCMCDiagnostics(constrained_chains=constrained_samples,
-                                            latent_log_prob_states=latent_log_prob_states, # eBFMI needs the log-prob, so we pass it to the diagnostics object; R-hat/ESS are gauge-invariant on pi, so we don't need a log-prob for that.
-                                            )
-        diag = self._diagnostics.summarize() if with_diagnostics else None
+        # R-hat/ESS are computed on the CONSTRAINED (pi) coordinates: on the latent chart they
+        # would be polluted by gauge drift (theta can move along GL(r) orbits without changing
+        # pi), whereas on pi they are gauge-invariant. eBFMI is the exception -- it needs the
+        # energy, so it reads the latent log-prob trace.
+        # The chains are pulled to host FIRST: `device_get` on a sharded array is a per-shard D2H
+        # copy (no collective), whereas reducing over the sharded ("chains",) axis on device issues
+        # an NCCL all-to-all inside `jit__reduce_max`, which fails on hosts where that collective is
+        # unavailable. On host input the reductions run on the default device only. Diagnostics are
+        # O(C*N*D) once per run, so the transfer cost is negligible next to sampling.
+        diag = None
+        if with_diagnostics:
+            self._diagnostics = MCMCDiagnostics(
+                constrained_chains=jax.device_get(constrained_samples),
+                latent_log_prob_states=jax.device_get(latent_log_prob_states),
+            )
+            diag = self._diagnostics.summarize()
 
         return MalaChainSummary(
             samples=constrained_samples,
