@@ -312,6 +312,29 @@ class MetropolisAdjustedLangevinSampler:
             stacked_mala_states=mix,   # full archive (incl. burn-in): latent theta + acceptance counts
         )
 
+    def thinned_plans(self, result, per_chain: int = 250, chunk: int = 100):
+        """Retained draws as full constrained plans, thinned per chain -- host-side (n_kept, dim).
+
+        The complement of ``max_pi_coords``: that caps which COORDINATES the diagnostics see,
+        this caps which DRAWS are expanded into whole plans. Latent ``theta`` is the manifest
+        (see ``MalaChainSummary``); materialising every retained draw as a plan costs
+        ``chains x draws x II*JJ`` and is not feasible at production plan sizes, so the draws
+        are thinned evenly per chain IN LATENT SPACE and mapped ``theta -> pi`` in chunks.
+        """
+        lat = np.asarray(jax.device_get(result.stacked_mala_states.stacked_latent_states))
+        lat = lat.reshape(lat.shape[0], lat.shape[1], -1)[:, -self.num_samples:, :]
+        keep = np.linspace(0, self.num_samples - 1,
+                           min(per_chain, self.num_samples)).astype(int)
+        lat = lat[:, keep, :].reshape(-1, lat.shape[-1])
+        plans = None
+        for s in range(0, lat.shape[0], chunk):
+            pis = np.asarray(self.support.to_constrained(jnp.asarray(lat[s:s + chunk])))
+            pis = pis.reshape(pis.shape[0], -1)
+            if plans is None:
+                plans = np.empty((lat.shape[0], pis.shape[-1]))
+            plans[s:s + chunk] = pis
+        return plans
+
     def initialize_diverse_chains(self, keys):
         denom = max(self.parallel_chains - 1, 1)
         if self.initial_plan is not None:
