@@ -619,12 +619,12 @@ gKL(marginals || priors), Gibbs divergence gKL(pi || pi_I), tilt statistic T = |
 finite differences (agreement 0.97-1.10 on all scalar segments, both phases); mean curves
 near-linear in gamma, so Ehat_0[O] is taken as the quadratic-LS intercept at gamma = 0 (an
 extrapolant -- the gamma = 0 chart target is improper, no chain exists there). For weakly
-coupled observables (table cells) the Cov route is noise-dominated (overstates bias ~8x); the
+coupled observables (table entries) the Cov route is noise-dominated (overstates bias ~8x); the
 certificate uses the grid extrapolation. Scripts: `e12_ridge_bias_grid.py` (record, incremental
 per-cell checkpoint) + `e12_ridge_bias_report.py` (certificate tables + 4-panel figure).
 
 **Certificate at gamma* = 0.40 (strengthened, threshold-free form).**
-1. Location: |bias|/sd med 0.107 / max 0.231, |bias|/band max 0.058 (serum, 89/169 live cells;
+1. Location: |bias|/sd med 0.107 / max 0.231, |bias|/band max 0.058 (serum, 89/169 live entries;
    annotation-W baseline). Coverage-budget restatement: a shift of b sd erodes nominal 95%
    coverage by ~0.115 b^2 -- measured med 0.07pp / max 0.45pp against a 0.7pp budget.
 2. Dual-column stability: correction is not decisive (extrapolation error ~ bias); BOTH columns
@@ -632,13 +632,128 @@ per-cell checkpoint) + `e12_ridge_bias_report.py` (certificate tables + 4-panel 
    change dominant destination).
 3. Width NOT certified from within the family: table sd shrinks ~gamma^-0.59 with no visible
    plateau -- the small-N gold anchor (R2 step 3) is the width calibrator.
-4. Structural root of the R_mu blow-up: the chart origin theta = 0 maps to the bare Gibbs kernel
-   exp(-C/eps), not the Sinkhorn plan, so the ridge shrinks toward a marginal-violating plan
-   (E[R_mu] rises ~36-40 nats per unit gamma). lambda(eta) must be solved under the ridged
-   scheme; a centered ridge gamma ||theta - theta_0||^2 (shrink toward the warm start = exact
-   rank-2 Sinkhorn factorisation) is the candidate fix -- it requires a re-determination of
-   gamma* and is evaluated before the production campaign.
+4. Structural root of the scalar blow-up (paper-grounded; HFPD-OT eq numbers): the chart
+   origin theta = 0 maps to pi_I, the IDEAL design = extended Gibbs kernel (eq 5), which is
+   unattainable by construction (eq 10-11). The uncentered ridge is therefore a chart-space
+   surrogate for raising the ideal-attraction temperature (Remark 2): E[R_mu] rises
+   ~36-40 nats per unit gamma (marginals drift from mu_0 toward pi_I's) and
+   E[gKL(pi||pi^o)] rises ~35-37 (pi^o = the certainty-equivalent plan, eq 29 -- what
+   `sinkhorn_init` computes; this observable was previously mislabelled g_piI). The
+   contamination corrupts lambda(eta), so lambda(eta) must be solved under the ridged
+   scheme; the candidate fix is a centered ridge gamma ||theta - theta_0||^2 with theta_0 =
+   the exact rank-2 factorisation of pi^o ~ the S^o mode in the strong-lambda regime -- a
+   quadratic penalty centred at the target mode has no first-order location effect.
+   Prediction: the gKL(pi||pi^o) slope flips sign. Requires re-determination of gamma*;
+   evaluated before the production campaign.
 
 **Reproduce:** `python scripts/experiments/e12_ridge_bias_grid.py --budget 500` then
 `python scripts/experiments/e12_ridge_bias_report.py`. Staging embeds on CPU (the jax pool must
 not compete with torch for device memory on shared boxes).
+
+### E12 addendum — centered ridge (2026-08-11)
+
+Scheme change adopted after the q(c|z) certificate: the ridge is centered at the warm start,
+gamma ||theta - theta_0||^2, theta_0 = the exact rank-2 factorisation of the
+certainty-equivalent plan pi^o (~ the S^o mode in the strong-lambda regime; a quadratic
+penalty centred at the target mode has no first-order location effect, unlike the uncentered
+penalty whose lever arm |theta_bar| ~ 90 chart units pulls toward the ideal pi_I).
+R1 re-determination (e11 --centered, 4 runs = both pairs x 2 chain seeds): gamma* = 0.40
+re-ratified, scheme-invariant, ESS improved (466-521 vs 309-368). Centered grid
+(e12 --exp cen): predictions confirmed -- g_pi0 slope flips negative, R_mu near-flat around
+~3.5 nats (design reference R_mu(pi^o) ~ 0.005; the gap is the modelled coupling
+uncertainty); E[T] collapses 9200 -> ~2000 (= m x posterior variance; the lever arm is
+gone). Certificate at gamma*: dox PASSES cleanly (|b|/sd med 0.065 max 0.146; erosion max
+0.17pp -- the diagonal-entry failure of the uncentered scheme is removed); serum med 0.070,
+worst entry 0.275 with extrapolation error 0.280 (unresolved) and erosion max 0.67pp inside
+the 0.7pp budget; dual-column stability holds in both phases. Mixing improves everywhere
+(ESS_med 975-1843; eBFMI increases with gamma); width sensitivity halves (gamma^-0.34/-0.37
+vs -0.90/-0.59). Cross-scheme gamma -> 0 intercepts agree on g_pi0 (~7.4) and correct the
+uncentered long-range extrapolation of R_mu (quote ~3.4-3.6 nats, not 1.6).
+
+**Reproduce:** `python scripts/experiments/e11_ridge_scale.py --budget 500 --ridges 0.2 0.3
+0.4 0.5 --skip-hessian --centered [--chain-seed 1] [--from-day 2 --to-day 2.5]` then
+`python scripts/experiments/e12_ridge_bias_grid.py --budget 500 --exp cen` and
+`python scripts/experiments/e12_ridge_bias_report.py --exp cen`. Single-GPU pinning
+(CUDA_VISIBLE_DEVICES) is ~20x faster than 2-GPU sharding on this host (NCCL P2P disabled:
+per-step collectives serialise through the host).
+
+### E12 addendum 2 — fixed kernel certification (2026-08-14)
+
+Kernel frozen: centered ridge, gamma* = 0.50, windowed warm-up W = 1200 (see the warm-up A/B:
+acceptance controlled at the 0.574 target with an MH-correct frozen kernel; eBFMI unmoved
+across warm-up schemes => kernel-level property, E13; gamma = 0.4 passes only under the
+legacy scheme's in-sampling adaptation, i.e. flattered by the correctness violation, so the
+R1 rule on the fixed kernel gives 0.50). Grid re-run with 0.5 as a grid point (--exp cenw).
+Certificate at gamma* = 0.50: dox passes clean (|b|/sd max 0.173, erosion max 0.27pp); serum
+passes on medians (med 0.125, 0.11pp) with the worst-entry tail extrapolation-model-limited:
+the mean curves carry a real, seed-reproducible non-monotone bump at small gamma (chain-seed
+probe agrees to <= 0.7 MCSE on scalars), the apparent tilt-identity failure there is the Cov
+noise floor at ~0.5 nats/gamma slopes, and the quad intercept's model error is comparable to
+the claimed worst bias. gamma* sits near the mean curves' stationary point, so observables
+are locally gamma-insensitive at the operating point. The gold anchor resolves the
+consolidated docket: chart bias, width calibration, and the small-gamma intercept.
+
+**Reproduce:** `python scripts/experiments/e12_ridge_bias_grid.py --budget 500 --exp cenw`
+then `python scripts/experiments/e12_ridge_bias_report.py --exp cenw`; seed probe:
+`... --ridges 0.4 0.5 0.6 --exp cenw_cs1 --chain-seed 1`.
+
+## E13 — the gold anchor: full-rank S^o at N=8 vs the chart family
+
+**Design.** N = 8 (plan dim 64): `full_rank` samples S^o exactly (no chart, no gauge, no
+ridge -- the impropriety lived in the chart's GL(r) orbits). Both arms share the SAME MALA
+schema (windowed warm-up W=1200, acceptance target, gates), differing only in the
+parametrisation, so gold-vs-chart differences are attributable (no tempering; fallback
+ladder is MALA-internal). Gold: 300k draws x 2 chain seeds x 4 chains. Chart arm: centered
+ridge, r in {2,4,8} x gamma in {0.05, 0.1, 0.2, 0.5}. Observables as E12 (q(c|z) tables,
+R_mu, R_nu, g_pi0).
+
+**Results.** Gold impeccable: R-hat 1.00/1.00, ESS ~47k, eBFMI 0.20-0.21, seeds agree to
+0.5-0.8 MCSE. Direct reads at N=8: E[R_mu] = 0.857-0.859 (both phases), E[g_pi0] = 8.63
+(dox) / 14.85 (serum). Chart family: (i) R_mu bias grows more negative with gamma
+(-0.43 at 0.1 to -0.60 at 0.5) and its gamma -> 0 intercept brackets (linear..quad fits on
+gate-passing rows) sit at -0.36..-0.47, far from 0; (ii) E[g_pi0] shows the expected
+centered-ridge bowl response (~2.4x across the ladder) riding on a gamma-INDEPENDENT ~10x
+concentration gap to gold; (iii) table-entry widths are 1.1-1.65x gold at gamma=0.5,
+inflating to ~2.8x as gamma -> 0, while plan-divergence spread is simultaneously ~10x
+UNDER -- direction-dependent variance distortion, not a scalar width factor; (iv) the rank
+effect at fixed gamma=0.2 is ~0.02 nats and not consistently monotone -- rank is not the
+driver; (v) gamma = 0.05 rungs are under-mixed (R-hat_max 1.23-1.40, gauge nearly
+unpinned) and are excluded from fits.
+
+**Interpretation (hypothesis, one discriminating probe pending).** At exhaustive rank
+(r = 8) with the ridge relaxed, the only remaining difference between the arms is the
+reference measure: the chart targets the pullback S^o(pi(theta)) dtheta WITHOUT the
+1/2 log det G volume factor; gold targets S^o(pi) dpi. The gamma-flat g_pi0 gap and the
+non-closing intercepts are consistent with the missing volume term as the dominant
+structural bias; the finite-gamma ladder brackets but cannot decide (the region below
+gamma = 0.05 is unsampleable). DISCRIMINATOR: `low_rank_section` (Option B) carries the
+exact volume term with a hard gauge and NO ridge -- no limit needed; it either closes onto
+gold or refutes the attribution. Also [RESULT]: the ridge scale does not transfer across N
+(gamma* = 0.5 crushes the wide N = 8 target) -- gamma is a per-N calibration.
+
+**Figure readings.** (a) Panel-A trend (bias more negative as gamma
+grows) is the centered ridge working as designed on a bowl observable: the ridge contracts
+the chart posterior onto pi^o, which is gold's mode, and since R_mu is a bowl whose gold
+mean is almost pure spread (E[R_mu] ~ R_mu(mode) + trace(H Sigma)/2, R_mu(pi^o) ~ 0.005 vs
+gold 0.857), more contraction pushes E_chart further below gold. The figure omits
+gate-failing rungs from panel A (their only content is panel D's story) and draws the
+gamma -> 0 intercepts as linear..quad brackets -- a plausible range, not a point estimate.
+(b) Panel-C anisotropy has one mechanism with both signs: g_pi0 = KL(pi || pi^o)
+accumulates variance ADDITIVELY (a bowl in every coordinate, no cancellation), so gold's 64
+near-independent fluctuations sum to a large KL radius the rank-r chart structurally caps
+(~10x under). A table entry is a SIGNED weighted aggregate: independent fluctuations
+partially cancel inside it, but the chart's moves perturb whole rows/columns of log pi
+coherently (one factor coordinate at a time) and coherent moves add in phase -- so the
+chart's smaller total variance is concentrated on exactly the directions table aggregates
+amplify (1.1-2.8x over). The chart redistributes covariance rather than shrinking it
+uniformly; no scalar width factor can correct both projections, and D2 held-out coverage
+remains the end-to-end audit for this anisotropy at production scale.
+
+**TODO (SIAM track, deliberately deferred):** run the `low_rank_section` discriminator
+(implemented in `supports.py`: pivoted hard gauge, exact 1/2 log det G_S by autodiff,
+ridge = 0) at N = 8 against the gold record -- the constructive test of the volume-term
+attribution. Off the production critical path: the Nature pipeline proceeds on the
+certified fixed kernel.
+
+**Reproduce:** `python scripts/experiments/e13_gold_anchor.py --budget 8 --exp gold` then
+`python scripts/experiments/e13_gold_report.py --exp gold`.
