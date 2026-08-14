@@ -9,7 +9,8 @@ bridge draws) and instruments the chains for the R2 protocol:
     - the marginal-KL statistics R_mu = gKL(mu_pi||mu_0), R_nu = gKL(nu_pi||nu_0)
       (the moments lambda(eta) matches -- the observable that decides whether the ratified ridge
       shifts the lambda calibration),
-    - the Gibbs divergence g = gKL(pi||pi_I) (the direct shrinkage readout),
+    - the divergence from the certainty-equivalent plan g = gKL(pi||pi0) (HFPD-OT eq 29;
+      pi0 = the KL-projection of the ideal pi_I onto the marginal polytope = sinkhorn_init),
     - t_i = ||theta_i||^2 (the sufficient statistic of the ridge tilt).
 
   per observable O: mean, sd, per-observable ESS/R-hat (chain structure preserved), MCSE,
@@ -57,8 +58,8 @@ from langevin_sampler import MetropolisAdjustedLangevinSampler, HFPDOTHyperprior
 # the same operating point, so gamma is the only factor varying across the grid.
 _SHARPNESS = 33.0
 
-GRID = (0.4, 0.6, 0.8, 1.2, 2.0)
-CFG = dict(num_samples=10_000, num_burnin=2_000, warm_up_steps=600, step_size=0.02,
+GRID = (0.4, 0.5, 0.6, 0.8, 1.2, 2.0)
+CFG = dict(num_samples=10_000, num_burnin=2_000, warm_up_steps=1_200, step_size=0.02,
            num_parallel_chains=4, seed=0)
 THIN_PER_CHAIN = 500
 CHUNK = 100
@@ -110,7 +111,7 @@ def gkl(p, q):
     return float(np.sum(p * (np.log(p) - np.log(np.maximum(q, _EPS)))) - p.sum() + q.sum())
 
 
-def run_cell(C, Ws, Wt, pops, ridge, day_from, day_to):
+def run_cell(C, Ws, Wt, pops, ridge, day_from, day_to, centered):
     n = C.shape[0]
     eps = float(C.max() - C.min()) / _SHARPNESS
     mu0, nu0 = np.full(n, 1 / n), 1.3 * np.full(n, 1 / n)
@@ -122,8 +123,12 @@ def run_cell(C, Ws, Wt, pops, ridge, day_from, day_to):
         target_score_fn=prior.hyperprior_score_fun,
         shape=n * n, support="positive_orthant", sampling_strategy="low_rank",
         II=n, JJ=n, rank=2, cost=jnp.asarray(C), epsilon=eps, ridge=ridge,
+        ridge_center="warm_start" if centered else None,
         initial_plan=prior.sinkhorn_init(), **CFG)
-    pi_I = np.asarray(prior.sinkhorn_init()).reshape(-1)
+    pi0 = np.asarray(prior.sinkhorn_init()).reshape(-1)   # pi^o, the CE plan (eq 29), NOT pi_I
+    # design-point reference moments: where R_mu/R_nu settle if the posterior sat at pi^o
+    P0 = pi0.reshape(n, n)
+    ref = dict(r_mu_pi0=gkl(P0.sum(1), mu0), r_nu_pi0=gkl(P0.sum(0), nu0))
 
     t0 = time.time()
     res = smp.sample(with_diagnostics=True, max_pi_coords=2000)
@@ -138,7 +143,10 @@ def run_cell(C, Ws, Wt, pops, ridge, day_from, day_to):
     keep = np.linspace(0, CFG["num_samples"] - 1, THIN_PER_CHAIN).astype(int)
     lat = lat[:, keep, :]
     Cn, D, m = lat.shape
-    t_stat = (lat ** 2).sum(axis=2)                                 # (C, D)
+    # tilt statistic of the ACTIVE scheme: T = ||theta - theta_0||^2 (theta_0 = 0 uncentered)
+    th0 = smp.support.ridge_center
+    dev = lat if th0 is None else lat - np.asarray(jax.device_get(th0)).reshape(1, 1, m)
+    t_stat = (dev ** 2).sum(axis=2)                                 # (C, D)
 
     K = len(pops)
     obs = np.empty((Cn, D, K * K + 3))
@@ -152,7 +160,7 @@ def run_cell(C, Ws, Wt, pops, ridge, day_from, day_to):
                 obs[c, s + j, :K * K] = T.reshape(-1)
                 obs[c, s + j, K * K] = gkl(P.sum(1), mu0)           # R_mu
                 obs[c, s + j, K * K + 1] = gkl(P.sum(0), nu0)       # R_nu
-                obs[c, s + j, K * K + 2] = gkl(pi, pi_I)            # Gibbs divergence
+                obs[c, s + j, K * K + 2] = gkl(pi, pi0)             # divergence from pi^o
     mins = (time.time() - t0) / 60
 
     # per-observable statistics with chain structure preserved
@@ -172,11 +180,15 @@ def run_cell(C, Ws, Wt, pops, ridge, day_from, day_to):
     qs = np.quantile(flat[:, :K * K], [0.025, 0.5, 0.975], axis=0)
     return dict(gates=gates, mean=mean, sd=sd, cov_ot=cov_ot, dvar=dvar, mcse=mcse,
                 ess=ess_o, band=qs[2] - qs[0], t_mean=float(tflat.mean()),
-                minutes=mins, n_obs=obs.shape[-1])
+                minutes=mins, n_obs=obs.shape[-1], **ref)
 
 
-def main(run_dir, budget, ridges, seed):
+def main(run_dir, budget, ridges, seed, exp, centered, chain_seed=None):
     print_device_banner()
+    if chain_seed is not None:
+        CFG["seed"] = chain_seed
+    print(f"ridge scheme: {'CENTERED at theta_0 = warm start (pi^o)' if centered else 'uncentered'}"
+          f"  record tag: {exp}")
     out = {}
     for day_from, day_to, phase in ((2.0, 2.5, "dox"), (12.0, 12.5, "serum")):
         C, Ws, Wt, pops = stage(run_dir, budget, day_from, day_to, seed)
@@ -185,10 +197,15 @@ def main(run_dir, budget, ridges, seed):
         print(f"\n[{phase}] D{day_from:g}->D{day_to:g}  N={C.shape[0]}  "
               f"contrast {(C.max() - C.min()) / np.median(C):.2f}")
         print(f"{'ridge':>6} {'rhat_med':>8} {'max':>5} | {'R_mu':>8} {'+-mcse':>7} "
-              f"{'bias1':>8} {'|b|/sd':>7} {'dVar/Var':>9} | {'g_piI':>8} {'|b|/sd':>7} | "
+              f"{'bias1':>8} {'|b|/sd':>7} {'dVar/Var':>9} | {'g_pi0':>8} {'|b|/sd':>7} | "
               f"{'tbl med|b|/sd':>13} {'max|b|/band':>11} {'mins':>5}")
+        first = True
         for ridge in ridges:
-            r = run_cell(C, Ws, Wt, pops, ridge, day_from, day_to)
+            r = run_cell(C, Ws, Wt, pops, ridge, day_from, day_to, centered)
+            if first:
+                print(f"  design-point reference: R_mu(pi^o) = {r['r_mu_pi0']:.4f}  "
+                      f"R_nu(pi^o) = {r['r_nu_pi0']:.4f}", flush=True)
+                first = False
             bias1 = -ridge * r["cov_ot"]                            # first-order location bias
             live = (r["mean"][:K * K] > 1e-4) & (r["band"] > 1e-6)
             if live.any():
@@ -209,9 +226,9 @@ def main(run_dir, budget, ridges, seed):
                     out[f"{phase}_{ridge:g}_{k}"] = v
             out[f"{phase}_{ridge:g}_gates"] = json.dumps(r["gates"])
             out[f"{phase}_populations"] = np.array(pops)
-            # incremental checkpoint: a killed run keeps every completed cell
-            np.savez(Path(run_dir) / f"e12_ridge_bias_b{budget}.npz", **out)
-    path = Path(run_dir) / f"e12_ridge_bias_b{budget}.npz"
+            # incremental checkpoint: a killed run keeps every completed grid cell
+            np.savez(Path(run_dir) / f"e12_ridge_bias_b{budget}_{exp}.npz", **out)
+    path = Path(run_dir) / f"e12_ridge_bias_b{budget}_{exp}.npz"
     np.savez(path, **out)
     print(f"\nrecord -> {path}")
 
@@ -222,5 +239,12 @@ if __name__ == "__main__":
     p.add_argument("--budget", type=int, default=500)
     p.add_argument("--ridges", type=float, nargs="+", default=list(GRID))
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--exp", type=str, required=True,
+                   help="record tag: e12_ridge_bias_b{budget}_{exp}.npz")
+    p.add_argument("--uncentered", action="store_true",
+                   help="legacy scheme: ridge on ||theta||^2 (pull toward the ideal pi_I)")
+    p.add_argument("--chain-seed", type=int, default=None,
+                   help="MCMC seed override at fixed subsample (equilibration probe)")
     a = p.parse_args()
-    main(a.run_dir or latest_run(), a.budget, a.ridges, a.seed)
+    main(a.run_dir or latest_run(), a.budget, a.ridges, a.seed, a.exp, not a.uncentered,
+         a.chain_seed)

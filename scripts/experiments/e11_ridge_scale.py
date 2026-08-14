@@ -38,7 +38,7 @@ from langevin_sampler import MetropolisAdjustedLangevinSampler, HFPDOTHyperprior
 
 
 def main(run_dir, budget, ridges, day_from, day_to, seed, sharpness, lam, lam_I, skip_hessian,
-         chain_seed=None):
+         chain_seed=None, centered=False, warmup="windowed", warm_up_steps=None):
     print_device_banner()
     C = real_cost(run_dir, budget, day_from, day_to, seed)
     eps = float(C.max() - C.min()) / sharpness
@@ -46,9 +46,11 @@ def main(run_dir, budget, ridges, day_from, day_to, seed, sharpness, lam, lam_I,
     # chain_seed varies the MCMC randomness at a FIXED subsample/cost (mixing replication);
     # `seed` varies the subsample itself (a different target cell)
     cfg = dict(BRIDGE, seed=seed if chain_seed is None else chain_seed)
+    if warm_up_steps is not None:
+        cfg["warm_up_steps"] = warm_up_steps
     print(f"E11 | N={n} (m=2r(II+JJ)={2 * 2 * n * 2 // 2}) | D{day_from:g}->D{day_to:g} | "
           f"lambda={lam} lam_I={lam_I} s={sharpness} (eps={eps:.4f}) | orthant, bridge config | "
-          f"chain seed {cfg['seed']}")
+          f"chain seed {cfg['seed']} | ridge {'CENTERED at pi^o' if centered else 'uncentered'} | warmup {warmup}")
     print(f"{'ridge':>7} {'kappa':>10} {'n<=0':>5} {'acc':>5} {'Rhat_med':>9} {'Rhat_max':>9} "
           f"{'ESS_med':>8} {'ESS_min':>8} {'eBFMI':>7} {'frozen':>7} {'mins':>6}")
     rows = []
@@ -61,6 +63,8 @@ def main(run_dir, budget, ridges, day_from, day_to, seed, sharpness, lam, lam_I,
             target_score_fn=prior.hyperprior_score_fun,
             shape=n * n, support="positive_orthant", sampling_strategy="low_rank",
             II=n, JJ=n, rank=2, cost=jnp.asarray(C), epsilon=eps, ridge=ridge,
+            ridge_center="warm_start" if centered else None,
+            warmup=warmup,
             initial_plan=prior.sinkhorn_init(), **cfg)
         spec = ({"kappa": float("nan"), "n_nonpos": -1} if skip_hessian
                 else hessian_spectrum(smp, prior))
@@ -85,7 +89,8 @@ def main(run_dir, budget, ridges, day_from, day_to, seed, sharpness, lam, lam_I,
               f"{row['rhat_med']:>9.2f} {row['rhat_max']:>9.2f} {row['ess_med']:>8.0f} "
               f"{row['ess_min']:>8.0f} {row['ebfmi_min']:>7.3f} {frozen:>7d} {mins:>6.1f}",
               flush=True)
-    out = Path(run_dir) / f"e11_ridge_scale_b{budget}_cs{cfg['seed']}.json"
+    tag = ("cen_" if centered else "") + ("wwin_" if warmup == "windowed" else "")
+    out = Path(run_dir) / f"e11_ridge_scale_{tag}b{budget}_D{day_from:g}_cs{cfg['seed']}.json"
     out.write_text(json.dumps(rows, indent=1))
     print(f"rows -> {out}")
 
@@ -105,6 +110,13 @@ if __name__ == "__main__":
                    help="skip the warm-start spectrum (m^2 memory at large N)")
     p.add_argument("--chain-seed", type=int, default=None,
                    help="MCMC seed at a FIXED subsample (mixing replication); default = --seed")
+    p.add_argument("--centered", action="store_true",
+                   help="centered ridge gamma||theta - theta_0||^2, theta_0 = warm start (pi^o)")
+    p.add_argument("--warmup", choices=["windowed", "legacy"], default="windowed",
+                   help="warm-up scheme (legacy = historical unadapted/pooled flow)")
+    p.add_argument("--warm-up-steps", type=int, default=None,
+                   help="override BRIDGE warm_up_steps (windowed: more steps = better mass)")
     a = p.parse_args()
     main(a.run_dir or latest_run(), a.budget, a.ridges, a.from_day, a.to_day, a.seed,
-         a.sharpness, a.lam, a.lam_I, a.skip_hessian, a.chain_seed)
+         a.sharpness, a.lam, a.lam_I, a.skip_hessian, a.chain_seed, a.centered, a.warmup,
+         a.warm_up_steps)

@@ -6,7 +6,7 @@ tables on stdout and (ii) ``e12_bias_grid.png`` next to the record.
 Notation (locked):
   E_gamma[O]    posterior mean of observable O under the gamma-tilted posterior
                 p_gamma propto p_0 exp(-gamma T), T = ||theta||^2; estimated by the
-                per-cell MC mean Ehat_gamma[O] (4 chains x 500 thinned draws).
+                per-entry MC mean Ehat_gamma[O] (4 chains x 500 thinned draws).
   Ehat_0[O]     quadratic least-squares intercept of {Ehat_gamma[O]} at gamma = 0. An
                 EXTRAPOLANT, not a sampled quantity: the gamma = 0 chart posterior is
                 improper along the GL(r) orbits, so no chain exists there. Its
@@ -16,9 +16,9 @@ Notation (locked):
   bias(gamma)   Ehat_gamma[O] - Ehat_0[O]  (grid-extrapolation bias; certificate input).
   bias1(gamma)  -gamma Covhat_gamma(O, T): first-order tilt-identity estimate. Quoted
                 only where |Cov| exceeds its MC error; noise-dominated for weakly
-                coupled observables (table cells), where it overstates bias(gamma).
+                coupled observables (table entries), where it overstates bias(gamma).
   sd(gamma)     posterior sd of O under gamma; band(gamma) = 2.5-97.5 interquantile
-                width. "Live" table cells: Ehat_{gamma*} > 1e-4 and band > 1e-6.
+                width. "Live" table entries: Ehat_{gamma*} > 1e-4 and band > 1e-6.
 
 Certificate at gamma* (strengthened form -- the raw 1/4-sd gate is threshold-sensitive
 and is retained only as a summary statistic):
@@ -29,7 +29,7 @@ and is retained only as a summary statistic):
   2. DUAL-COLUMN CONCLUSION STABILITY. Both Ehat_gamma* and Ehat_0 are reported (the
      latter with its total extrapolation error: statistical se of the weighted quad-LS
      intercept + model-form spread max(|quad - linear|, grid jackknife)); every
-     qualitative claim (cell ranking, per-row dominant destination) must be invariant
+     qualitative claim (entry ranking, per-row dominant destination) must be invariant
      between the two columns. This makes the argument threshold-free: the correction is
      the same order as its own error at the current grid, so neither column is
      privileged, and conclusions must not depend on the choice.
@@ -52,9 +52,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-GRID = np.array([0.4, 0.6, 0.8, 1.2, 2.0])
-GAMMA_STAR = 0.4
-SCALARS = ("R_mu", "R_nu", "g_piI")
+GAMMA_STAR = 0.5
+SCALARS = ("R_mu", "R_nu", "g_pi0")
+
+
+def record_grid(z, phase):
+    """Gamma grid read from the record's keys (records differ across campaigns)."""
+    gs = {float(k.split("_")[1]) for k in z.files
+          if k.startswith(f"{phase}_") and k.endswith("_mean")}
+    return np.array(sorted(gs))
 
 
 def load_phase(z, phase, grid):
@@ -65,6 +71,8 @@ def load_phase(z, phase, grid):
     d["t_mean"] = np.array([z[f"{phase}_{g:g}_t_mean"] for g in grid])
     d["pops"] = z[f"{phase}_populations"]
     d["K"] = K
+    ref_key = f"{phase}_{grid[0]:g}_r_mu_pi0"
+    d["r_mu_pi0"] = float(z[ref_key]) if ref_key in z.files else None
     return d
 
 
@@ -99,7 +107,7 @@ def extrapolation_error(grid, y, mcse):
 
 
 def scalar_indices(K):
-    return {"R_mu": K * K, "R_nu": K * K + 1, "g_piI": K * K + 2}
+    return {"R_mu": K * K, "R_nu": K * K + 1, "g_pi0": K * K + 2}
 
 
 def live_mask(d, gstar_row=0):
@@ -136,7 +144,7 @@ def report_phase(phase, d, grid, gstar):
               f"bias {b:>+9.3f} nats  |b|/sd {abs(b) / sd[g0, j]:>7.2f}  "
               f"(first-order {-gstar * cov[g0, j]:>+9.3f})")
 
-    print(f"\nlive table cells: {int(live.sum())}/{K * K}")
+    print(f"\nlive table entries: {int(live.sum())}/{K * K}")
     if not live.any():
         print("  table certificate SKIPPED: observable vacuous for this pair")
         return
@@ -149,7 +157,7 @@ def report_phase(phase, d, grid, gstar):
           f"(gate 0.25; first-order med {np.median(t1 / s0):.3f} -- noise-dominated)")
     print(f"    |b|/band  med {np.median(tb / b0):.3f}  max {np.max(tb / b0):.3f}")
     print(f"    |b| abs   med {np.median(tb):.5f}  max {np.max(tb):.5f}  "
-          f"(cell means med {np.median(mean[g0, :K * K][live]):.4f})")
+          f"(entry means med {np.median(mean[g0, :K * K][live]):.4f})")
     print(f"    mcse/sd   med {np.median(d['mcse'][g0, :K * K][live] / s0):.3f}")
     p = np.polyfit(np.log(grid), np.log(wr), 1)
     print(f"    width: med sd ratio vs gamma* {np.array2string(wr, precision=3)} "
@@ -197,7 +205,7 @@ def make_figure(S, D, grid, gstar, out_path):
 
     # A: scalar mean curves, quad fits extended to 0, Ehat_0 intercepts.
     a = ax[0, 0]
-    cols = {"R_mu": "#1f6fb2", "R_nu": "#7aa8d0", "g_piI": "#c0504d"}
+    cols = {"R_mu": "#1f6fb2", "R_nu": "#7aa8d0", "g_pi0": "#c0504d"}
     for name, j in idx.items():
         a.plot(grid, S["mean"][:, j], "o-", color=cols[name], ms=4,
                label=f"{name} (serum)")
@@ -211,6 +219,12 @@ def make_figure(S, D, grid, gstar, out_path):
                xy=(gstar, S["mean"][g0, idx["R_mu"]]), xytext=(0.62, 34), fontsize=8.5,
                arrowprops=dict(arrowstyle="-", lw=0.6))
     a.axvline(gstar, color="0.6", lw=0.7, ls=":")
+    if S.get("r_mu_pi0") is not None:
+        # design-point asymptote: R_mu decays toward R_mu(pi^o) as gamma -> inf; the offset
+        # above it at gamma* is the posterior's modelled spread, not bias
+        a.axhline(S["r_mu_pi0"], color="0.35", lw=0.8, ls="--")
+        a.text(grid[-1] * 0.99, S["r_mu_pi0"], "$R_\\mu(\\pi^o)$ floor", ha="right",
+               va="bottom", fontsize=7.5, color="0.35")
     a.set_xlabel("$\\gamma$")
     a.set_ylabel("$\\hat{E}_\\gamma[O]$ (nats)")
     a.set_title("A  scalars: near-linear in $\\gamma$; stars = $\\hat{E}_0$ "
@@ -218,15 +232,28 @@ def make_figure(S, D, grid, gstar, out_path):
     a.legend(fontsize=7.5, loc="upper left")
     a.set_xlim(-0.07, grid[-1] * 1.02)
 
-    # B: table-cell location bias in sd units, against the extrapolated intercept.
+    # Per-phase table statistics for panels B and C: location bias in sd units and the
+    # width ratio, each on the phase's own live set.
+    phase_styles = (("serum", S, "#1f6fb2", "#12365a"),
+                    ("dox", D, "#e08a4f", "#a03d13"))
+    tables = {}
+    for name, P, faint, bold in phase_styles:
+        lv = live_mask(P)
+        e0p = quad_intercept(grid, P["mean"])
+        tb = (P["mean"][:, :K * K][:, lv] - e0p[:K * K][lv]) / \
+            np.maximum(P["sd"][g0, :K * K][lv], 1e-12)
+        wr = P["sd"][:, :K * K][:, lv] / np.maximum(P["sd"][g0, :K * K][lv], 1e-12)
+        tables[name] = (lv, tb, wr)
+
+    # B: table-cell location bias, both phases overlaid.
     b = ax[0, 1]
-    tb = (S["mean"][:, :K * K][:, live] - e0s[:K * K][live]) / \
-        np.maximum(S["sd"][g0, :K * K][live], 1e-12)
-    b.plot(grid, tb, color="#1f6fb2", alpha=0.10, lw=0.8)
-    b.plot(grid, np.median(tb, axis=1), "o-", color="#12365a", lw=2, ms=4,
-           label="median cell")
-    b.plot(grid, np.percentile(np.abs(tb), 95, axis=1), "^-", color="#b2551f",
-           lw=1.4, ms=4, label="95th pct of |bias|")
+    for name, P, faint, bold in phase_styles:
+        lv, tb, _ = tables[name]
+        b.plot(grid, tb, color=faint, alpha=0.10, lw=0.8)
+        b.plot(grid, np.median(tb, axis=1), "o-", color=bold, lw=2, ms=4,
+               label=f"median ({name}, {int(lv.sum())} entries)")
+        b.plot(grid, np.percentile(np.abs(tb), 95, axis=1), "^--", color=bold,
+               lw=1.2, ms=4, alpha=0.8, label=f"p95 |bias| ({name})")
     b.axhspan(-0.25, 0.25, color="#3a9d5c", alpha=0.12)
     b.axhline(0, color="0.5", lw=0.6)
     b.axvline(gstar, color="0.6", lw=0.7, ls=":")
@@ -234,29 +261,31 @@ def make_figure(S, D, grid, gstar, out_path):
            va="top", fontsize=8, color="#2a7345")
     b.set_xlabel("$\\gamma$")
     b.set_ylabel("$(\\hat{E}_\\gamma[O] - \\hat{E}_0[O])\\; /\\; $sd$(\\gamma^*)$")
-    b.set_title(f"B  LOCATION: {int(live.sum())} live serum table cells "
+    b.set_title("B  LOCATION: live table entries per phase "
                 "($\\hat{E}_0$ extrapolated, not sampled)", fontsize=9.5)
-    b.legend(fontsize=7.5, loc="lower left")
+    b.legend(fontsize=7, loc="lower left")
     b.set_xlim(-0.07, grid[-1] * 1.02)
 
-    # C: table-cell width ratio; the gamma -> 0 plateau is outside the data.
+    # C: table-cell width ratio, both phases; the gamma -> 0 plateau is outside the data.
     c = ax[1, 0]
-    wr = S["sd"][:, :K * K][:, live] / np.maximum(S["sd"][g0, :K * K][live], 1e-12)
-    c.plot(grid, wr, color="#1f6fb2", alpha=0.10, lw=0.8)
-    med = np.median(wr, axis=1)
-    c.plot(grid, med, "o-", color="#12365a", lw=2, ms=4, label="median cell")
-    p = np.polyfit(np.log(grid), np.log(med), 1)
-    c.plot(gg[gg > 0.05], np.exp(np.polyval(p, np.log(gg[gg > 0.05]))), "--",
-           color="#b2551f", lw=1.2, label=f"power law $\\gamma^{{{p[0]:.2f}}}$")
+    for name, P, faint, bold in phase_styles:
+        _, _, wr = tables[name]
+        c.plot(grid, wr, color=faint, alpha=0.08, lw=0.8)
+        med = np.median(wr, axis=1)
+        c.plot(grid, med, "o-", color=bold, lw=2, ms=4, label=f"median entry ({name})")
+        p = np.polyfit(np.log(grid), np.log(med), 1)
+        c.plot(gg[gg > 0.05], np.exp(np.polyval(p, np.log(gg[gg > 0.05]))), "--",
+               color=bold, lw=1.2, alpha=0.8,
+               label=f"$\\gamma^{{{p[0]:.2f}}}$ ({name})")
     c.axvspan(0, gstar, color="#b2551f", alpha=0.08)
-    c.text(gstar / 2, 0.55, "plateau\nunidentified:\ngold anchor\n(step 3)",
+    c.text(gstar / 2, 0.35, "plateau\nunidentified:\ngold anchor\n(step 3)",
            ha="center", fontsize=8, color="#7c3a12")
     c.axvline(gstar, color="0.6", lw=0.7, ls=":")
     c.axhline(1.0, color="0.5", lw=0.6)
     c.set_xlabel("$\\gamma$")
     c.set_ylabel("sd$(\\gamma)$ / sd$(\\gamma^*)$")
-    c.set_title("C  WIDTH: ridge narrows table posteriors; $\\gamma\\to 0$ limit "
-                "unknown", fontsize=9.5)
+    c.set_title("C  WIDTH: ridge narrows table posteriors; dox steeper than serum",
+                fontsize=9.5)
     c.legend(fontsize=7.5)
     c.set_xlim(-0.07, grid[-1] * 1.02)
     c.set_ylim(0, 1.9)
@@ -299,10 +328,12 @@ def make_figure(S, D, grid, gstar, out_path):
 def main(run_dir, budget, gstar, exp):
     run_dir = Path(run_dir)
     z = np.load(run_dir / f"e12_ridge_bias_b{budget}_{exp}.npz", allow_pickle=True)
-    S, D = load_phase(z, "serum", GRID), load_phase(z, "dox", GRID)
+    grid = record_grid(z, "serum")
+    print(f"record grid: {grid}  gamma* = {gstar}")
+    S, D = load_phase(z, "serum", grid), load_phase(z, "dox", grid)
     for phase, d in (("dox", D), ("serum", S)):
-        report_phase(phase, d, GRID, gstar)
-    make_figure(S, D, GRID, gstar, run_dir / f"e12_bias_grid_{budget}_{exp}.png")
+        report_phase(phase, d, grid, gstar)
+    make_figure(S, D, grid, gstar, run_dir / f"e12_bias_grid_{budget}_{exp}.png")
 
 
 if __name__ == "__main__":
