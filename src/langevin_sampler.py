@@ -192,6 +192,22 @@ class MetropolisAdjustedLangevinSampler:
         if hasattr(self.support, "num_free"):
             self.shape = self.support.num_free
 
+        # Optional ridge centering: "warm_start" places the ridge at theta_0 = the chart
+        # coordinates of initial_plan (exact rank-2 factorisation of the certainty-equivalent
+        # plan pi^o when initial_plan = sinkhorn_init). Uncentered (None, the default) penalises
+        # ||theta||^2, whose zero maps to the ideal design pi_I -- a first-order ideal-ward pull
+        # on every observable. An explicit array is accepted for custom centres.
+        ridge_center = kwargs.get("ridge_center", None)
+        if ridge_center is not None and hasattr(self.support, "ridge_center"):
+            if isinstance(ridge_center, str):
+                if ridge_center != "warm_start":
+                    raise ValueError(f"ridge_center must be 'warm_start', an array, or None; got {ridge_center!r}")
+                if self.initial_plan is None:
+                    raise ValueError("ridge_center='warm_start' requires an initial_plan.")
+                ridge_center = self.support.to_unconstrained(
+                    self.initial_plan.reshape(1, -1)).reshape(self.shape)
+            self.support.ridge_center = jnp.asarray(ridge_center).reshape(self.shape)
+
         # Optional constant dense preconditioner: whiten by the mode-Hessian metric,
         # M = [-d^2 log q(theta*)]^{-1} (experiment 1). Wraps the support so the sampler runs
         # isotropically in whitened coords; needs a warm-start mode to evaluate the Hessian.

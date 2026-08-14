@@ -254,6 +254,13 @@ class LowRank(Support):
         # pi-marginal. The principled, non-distorting fix is a prior on the shift Sum(ell)
         # only (mirroring the Simplex radial prior), or the Jeffreys volume term 1/2 log det G.
         self.ridge = float(ridge)
+        # Optional ridge center theta_0 (shape (m,)). None = uncentered: penalty on ||theta||^2,
+        # whose zero maps to the IDEAL design pi_I = exp(-C/eps) (the chart origin) and therefore
+        # exerts a first-order pull toward the ideal. Centered at the warm start (the exact
+        # rank-2 factorisation of the certainty-equivalent plan pi^o ~ the S^o mode in the
+        # strong-lambda regime), the quadratic penalty has no first-order location effect --
+        # the gauge is still broken (strictly convex along GL(r) orbits either way).
+        self.ridge_center: Array | None = None
         self.log_K = -jnp.asarray(cost).reshape(II, JJ) / epsilon  # fixed -C/eps offset
 
         # Fully-free coordinates: U (II, r) then V (JJ, r), m = r(II+JJ). The r**2 GL(r)
@@ -327,7 +334,8 @@ class LowRank(Support):
         # NOTE: v1 omits the Jeffreys volume term 1/2 log det G(theta); this targets the
         # pullback log p(pi(theta)) plus the gauge-breaking ridge. Per-state (vmapped).
         pi = self.to_constrained(theta).reshape(1, self.II * self.JJ)
-        return target_log_prob_fn(pi) - self.ridge * jnp.sum(theta ** 2)
+        dev = theta if self.ridge_center is None else theta - self.ridge_center
+        return target_log_prob_fn(pi) - self.ridge * jnp.sum(dev ** 2)
 
     def latent_score(self, target_score_fn: ScoreFn, theta: Array) -> Array:
         """Exact chain rule of ``log p(pi(theta))`` through ``pi = to_constrained(U V^T - C/eps)``,
@@ -352,7 +360,8 @@ class LowRank(Support):
         # contract is latent_score == grad(latent_log_prob). The old `with_ridge=False` default
         # silently broke it: the sampler calls latent_score(fn, x), so the MALA drift ignored the
         # very term meant to pin the runaway simplex softmax-shift gauge. (No-op when ridge=0.)
-        return grad - 2.0 * self.ridge * theta                          # grad of -ridge*||theta||^2
+        dev = theta if self.ridge_center is None else theta - self.ridge_center
+        return grad - 2.0 * self.ridge * dev                    # grad of -ridge*||theta - theta_0||^2
 
 
 class LowRankSection(LowRank):
