@@ -10,6 +10,11 @@ Two result sets are written under the run directory: the per-pair and composed *
 (the quantitative lineage answer) and a **force-directed layout** of the latent landscape coloured by
 day and by fate (the qualitative one).
 
+Fate membership is the GMVAE posterior responsibility matrix ``q(c|z)`` throughout (single-source
+doctrine): the soft memberships carry the identity uncertainty into the tables, are defined for
+every cell at every day (curated annotations have 0% coverage before D6), and let the composed
+lineage root at the first timepoint.
+
 PROVISIONAL: the per-day radius reported here is the multimodality gap ``KL(psi_bar || psi_0)``, which
 measures how far the latent population departs from a single Gaussian. It is a spread statistic, NOT
 an uncertainty about the marginal, so it is carried as a placeholder to unblock the pipeline and is
@@ -39,33 +44,43 @@ import run_gmvae_train as R
 from gmvae.networks import GMVAENet
 from gmvae.embedder import VaDEEmbedder
 from gmvae_confusion import latest_run
+from wadd_artifacts import artifact_dir
 from wadd_dim_reduction import CoverageSubsampler, gaussianity_gap
 from wadd_ot import CellCloud, GaussianW2, uot_plan
 from wadd_lineage import (transition_table, compose_plans, population_distributions,
                           TransitionTable)
 
 _INK, _MUTED, _GRID = "#1e293b", "#64748b", "#e2e8f0"
+# Below this max-responsibility the MAP fate is unreliable; such cells are greyed in the layout.
+_MIN_FATE_CONF = 0.5
 
 
 def _stage(model, cfg, days, budget, device):
     """Embed every day, take its placeholder radius, and subsample to the transport budget.
 
     Returns per-day dicts carrying the subsampled latent posterior and membership -- everything the
-    transport and lineage steps need, already row-aligned.
+    transport and lineage steps need, already row-aligned. Membership is the GMVAE posterior
+    responsibility matrix ``q(c|z)`` (single-source doctrine): the same posterior that drives every
+    other uncertainty also carries each cell's fate membership, soft -- so the tables inherit the
+    membership uncertainty instead of thresholding it away. Curated annotations (0% coverage before
+    D6) are not used. Component ``k`` carries the label of its seed population, so ``pops`` still
+    names the table axes.
     """
     embedder = VaDEEmbedder(model, device=device, batch_size=cfg.get("batch_size", 512))
-    matrices, memberships, pops = R.assemble(days)
+    matrices, _, pops = R.assemble(days)
     sub = CoverageSubsampler()
     staged = []
-    print(f"\n{'day':>6} {'cells':>7} {'kept':>6} {'radius(gap)':>12}")
-    for exp, memb in zip(matrices, memberships):
+    print(f"\n{'day':>6} {'cells':>7} {'kept':>6} {'radius(gap)':>12} {'med max q(c|z)':>15}")
+    for exp in matrices:
         post = embedder.embed(exp)
         radius = gaussianity_gap(post, n_samples=1024)          # PROVISIONAL placeholder (see docstring)
         idx = sub.indices(post, min(budget, len(post)))
+        sel = post.select(idx)
+        W = np.asarray(sel.prob_cat, dtype=np.float64)
         staged.append({"day": exp.day, "n": len(post), "radius": radius,
-                       "posterior": post.select(idx),
-                       "membership": memb.align_populations(pops).matrix[idx]})
-        print(f"{exp.day:>6} {len(post):>7} {len(idx):>6} {radius:>12.3f}")
+                       "posterior": sel, "membership": W})
+        print(f"{exp.day:>6} {len(post):>7} {len(idx):>6} {radius:>12.3f} "
+              f"{np.median(W.max(axis=1)):>15.3f}")
     return staged, pops
 
 
@@ -80,17 +95,17 @@ def _pairwise_tables(staged, pops, reg, reg_m):
     the PLANS (cell level) and coarse-graining once, not by chaining the tables.
     """
     tables, plans = [], []
-    print(f"\n{'pair':>14} {'plan mass':>10} {'labelled src':>13} {'top flow'}")
+    print(f"\n{'pair':>14} {'plan mass':>10} {'med max q':>10} {'top flow'}")
     for a, b in zip(staged, staged[1:]):
         plan = uot_plan(_cloud(a["posterior"]), _cloud(b["posterior"]),
                         cost=GaussianW2(), reg=reg, reg_m=reg_m)
         T = transition_table(plan, a["membership"], b["membership"], pops, pops,
                              source_day=a["day"], target_day=b["day"])
         tables.append(T); plans.append(plan)
-        n_lab = int((a["membership"].sum(axis=1) > 0).sum())
+        conf = float(np.median(a["membership"].max(axis=1)))
         live = [(c, d, v) for c, row in zip(pops, T.matrix) for d, v in zip(pops, row) if v > 0]
         top = max(live, key=lambda t: t[2]) if live else ("-", "-", 0.0)
-        print(f"D{a['day']:<5g}->D{b['day']:<5g} {plan.sum():>10.4f} {n_lab:>13} "
+        print(f"D{a['day']:<5g}->D{b['day']:<5g} {plan.sum():>10.4f} {conf:>10.3f} "
               f"{top[0]} -> {top[1]} ({top[2]:.2f})")
     return tables, plans
 
@@ -100,9 +115,7 @@ def _span_table(staged, plans, pops, start_idx):
 
     Composing plans assumes the cell process is Markov in the latent state (Chapman-Kolmogorov over
     the intermediate timepoints) -- an assumption, but the weaker one available: chaining population
-    tables instead would need that same property plus lumpability of the fate partition. Population
-    chaining also fails outright here, since the early unlabelled days give all-zero tables that
-    annihilate the product.
+    tables instead would need that same property plus lumpability of the fate partition.
     """
     K = compose_plans(plans[start_idx:])
     a, b = staged[start_idx], staged[-1]
@@ -157,7 +170,7 @@ def _layout(staged, pops, per_day, seed=0):
         xs.append(post.means[take])
         days.append(np.full(len(take), s["day"]))
         fates.append(np.argmax(s["membership"][take], axis=1))
-        fates[-1][s["membership"][take].sum(axis=1) == 0] = -1        # unlabelled
+        fates[-1][s["membership"][take].max(axis=1) < _MIN_FATE_CONF] = -1   # low-confidence q(c|z)
     X = np.vstack(xs); day = np.concatenate(days); fate = np.concatenate(fates)
 
     k = 8
@@ -186,7 +199,8 @@ def _plot_layout(P, day, fate, pops, out):
 
     present = [c for c in np.unique(fate) if c >= 0]
     cmap = plt.get_cmap("tab20")
-    axes[1].scatter(P[fate < 0, 0], P[fate < 0, 1], c="#d4d4d8", s=4, linewidths=0, label="unlabelled")
+    axes[1].scatter(P[fate < 0, 0], P[fate < 0, 1], c="#d4d4d8", s=4, linewidths=0,
+                    label=f"uncertain (max q < {_MIN_FATE_CONF:g})")
     for i, c in enumerate(present):
         m = fate == c
         axes[1].scatter(P[m, 0], P[m, 1], color=cmap(i % 20), s=5, linewidths=0, label=pops[c])
@@ -217,15 +231,15 @@ def main(run_dir, budget, layout_per_day, reg, reg_m, days_spec=None):
     staged, pops = _stage(model, cfg, days, budget, device)
     tables, plans = _pairwise_tables(staged, pops, reg, reg_m)
 
-    # Span from the first timepoint that actually carries labelled cells: earlier days are unlabelled
-    # by design (fate is undetermined), so a lineage rooted there has no source populations to follow.
-    labelled = [i for i, s in enumerate(staged) if (s["membership"].sum(axis=1) > 0).sum() >= 10]
-    start = labelled[0] if labelled else 0
+    # q(c|z) membership is defined for every cell at every day, so the composed lineage roots at the
+    # first timepoint. (Curated annotations forced a later root: coverage is 0% before D6.)
+    start = 0
     overall = _span_table(staged, plans, pops, start)
-    print(f"\nlineage root: D{staged[start]['day']:g} (first day with >=10 labelled cells in budget)")
+    print(f"\nlineage root: D{staged[start]['day']:g}")
 
-    out = run_dir / "lineage"
-    out.mkdir(exist_ok=True)
+    out = artifact_dir(run_dir, "lineage",
+                       config=dict(budget=budget, layout_per_day=layout_per_day,
+                                   reg=reg, reg_m=list(reg_m), days=list(days)))
     np.savez(out / "transition_tables.npz",
              pairs=np.array([[t.source_day, t.target_day] for t in tables]),
              matrices=np.stack([t.matrix for t in tables]),
