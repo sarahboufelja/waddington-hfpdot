@@ -54,6 +54,7 @@ import run_gmvae_train as R
 from gmvae.networks import GMVAENet
 from gmvae.embedder import VaDEEmbedder
 from gmvae_confusion import latest_run
+from wadd_artifacts import artifact_dir
 from wadd_dim_reduction import RandomSubsampler
 from wadd_ot import CellCloud, GaussianW2
 from wadd_lineage import transition_table
@@ -157,7 +158,7 @@ def main(run_dir, budget, lambdas, lam_I, eps, day_from, day_to, n_samples, chai
                         float(spreads.mean()), float(spreads.std()), entry_sd))
 
     arr = np.array(results)
-    out = run_dir / "plan_uncertainty.npz"
+    out = artifact_dir(run_dir, "plan_uncertainty") / "plan_uncertainty.npz"
     coord_dump = {f"{k}_{lam:g}": v[k] for lam, v in per_coord.items()
                   for k in ("rhat", "ess", "mass", "accept")}
     np.savez(out, lam=arr[:, 0], draws=arr[:, 1], rhat=arr[:, 2], ess=arr[:, 3],

@@ -1,4 +1,8 @@
-"""Plan-uncertainty bands on the FLE over the fate territories -- the L2 overlay (PLACEHOLDER).
+"""Plan-uncertainty bands on the FLE over the fate territories -- the L2 overlay.
+
+The title states the kernel provenance read from the record itself: records carrying a
+positive ridge scale ``gamma`` were produced under the certified fixed kernel; records
+without one predate the ratification and are labelled UNCERTIFIED.
 
 Takes a particle-filter record (``run_particle_filter.py``) and paints, for each day of the window,
 the filter's support cells on the published layout coloured by how undetermined their descendant
@@ -41,6 +45,7 @@ import run_gmvae_train as R
 from gmvae.networks import GMVAENet
 from gmvae.embedder import VaDEEmbedder
 from gmvae_confusion import latest_run
+from wadd_artifacts import latest_artifact
 from wadd_dim_reduction import RandomSubsampler
 from wadd_data_ingest import read_fle_coords
 
@@ -68,7 +73,8 @@ def coarse_of(name):
 
 def load_identity_base(run_dir):
     """Full-landscape base from the L1 overlay record: coords + coarse MAP fate per cell."""
-    d = np.load(Path(run_dir) / "fle_uncertainty.npz", allow_pickle=True)
+    d = np.load(latest_artifact(run_dir, "fle_uncertainty") / "fle_uncertainty.npz",
+                allow_pickle=True)
     pops = [str(p) for p in d["populations"]]
     coarse = np.array([_COARSE_ORDER.index(coarse_of(p)) for p in pops])
     return d["x"], d["y"], coarse[d["map_fate"]]
@@ -178,8 +184,12 @@ def main(record_path, run_dir, budget, seed, coords_path):
     cb.set_label("descendant-mass spread  sd/mean  (ensemble)", color=_MUTED, fontsize=9)
     cb.ax.tick_params(colors=_MUTED, labelsize=8)
     cb.outline.set_visible(False)
-    fig.suptitle("Plan-uncertainty bands over the fate territories  —  PLACEHOLDER "
-                 "(sampler diagnostics attached; size = mean descendant mass)", color=_INK,
+    gam = rec.get("gamma", None)
+    prov = (f"certified fixed kernel (gamma = {float(gam):g}, gates stamped per panel)"
+            if gam is not None and float(gam) > 0 else
+            "UNCERTIFIED KERNEL (pre-ratification record; gates stamped per panel)")
+    fig.suptitle("Plan-uncertainty bands over the fate territories  —  " + prov +
+                 "; size = mean descendant mass", color=_INK,
                  fontsize=11.5, fontweight="bold", x=0.01, ha="left")
     out = Path(record_path).with_suffix("").as_posix() + "_fle.png"
     fig.savefig(out, dpi=170, bbox_inches="tight")

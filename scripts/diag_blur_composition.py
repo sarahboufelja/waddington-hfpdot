@@ -41,6 +41,7 @@ import run_gmvae_train as R
 from gmvae.networks import GMVAENet
 from gmvae.embedder import VaDEEmbedder
 from gmvae_confusion import latest_run
+from wadd_artifacts import artifact_dir
 from wadd_dim_reduction import CoverageSubsampler
 from wadd_ot import CellCloud, GaussianW2, uot_plan
 from wadd_lineage import transition_table, compose_plans, population_distributions
@@ -148,8 +149,7 @@ def main(run_dir, budget, eps_list, reg_m, days_spec=None):
         print()
 
     arr = np.array(results)
-    out = run_dir / "lineage" / "blur_diagnostic.npz"
-    out.parent.mkdir(exist_ok=True)
+    out = artifact_dir(run_dir, "blur_diagnostic") / "blur_diagnostic.npz"
     np.savez(out, epsilon=arr[:, 0], day_from=arr[:, 1], day_to=arr[:, 2], steps=arr[:, 3],
              spread_direct=arr[:, 4], spread_composed=arr[:, 5])
 

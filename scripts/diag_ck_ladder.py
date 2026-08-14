@@ -42,6 +42,7 @@ import torch
 import run_gmvae_train as R
 from gmvae.networks import GMVAENet
 from gmvae_confusion import latest_run
+from wadd_artifacts import artifact_dir
 from diag_blur_composition import stage, row_spread, _plan, _table_from_kernel
 from wadd_lineage import compose_plans
 
@@ -108,8 +109,7 @@ def main(run_dir, budget, eps, reg_m, day_from, day_to):
         print(f"  intercept at n=0            exp({a:.3f}) = {np.exp(a):.3f}   "
               f"(NOT a bias-free value -- see module docstring)")
 
-    out = run_dir / "lineage" / "ck_ladder.npz"
-    out.parent.mkdir(exist_ok=True)
+    out = artifact_dir(run_dir, "ck_ladder") / "ck_ladder.npz"
     np.savez(out, n_steps=arr[:, 0], gap_days=arr[:, 1], spread=arr[:, 2], vs_direct=arr[:, 3],
              epsilon=eps, day_from=day_from, day_to=day_to)
     print(f"\nseries -> {out}")

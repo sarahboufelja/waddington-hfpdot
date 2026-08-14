@@ -41,6 +41,7 @@ import run_gmvae_train as R
 from gmvae.networks import GMVAENet
 from gmvae.embedder import VaDEEmbedder
 from gmvae_confusion import latest_run
+from wadd_artifacts import artifact_dir
 from wadd_data_ingest import read_fle_coords
 
 _INK, _MUTED, _BASE = "#1e293b", "#64748b", "#dbe1ea"
@@ -143,14 +144,17 @@ def main(run_dir, coords_path, mincnt, gridsize):
                  r"$\eta = H(\bar\pi)$,  per cell", color=_INK, fontsize=12.5,
                  fontweight="bold", x=0.02, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.94))
-    out_png = run_dir / "fle_uncertainty.png"
+    out = artifact_dir(run_dir, "fle_uncertainty",
+                       config=dict(coords=str(coords_path), mincnt=mincnt,
+                                   gridsize=gridsize))
+    out_png = out / "fle_uncertainty.png"
     fig.savefig(out_png, dpi=170)
     plt.close(fig)
 
-    np.savez(run_dir / "fle_uncertainty.npz", x=x, y=y, day=day_arr, ambiguity=amb,
+    np.savez(out / "fle_uncertainty.npz", x=x, y=y, day=day_arr, ambiguity=amb,
              distinctiveness=dist, map_fate=fate, map_confidence=conf,
              populations=np.array(pops))
-    print(f"table -> {run_dir/'fle_uncertainty.npz'}   figure -> {out_png}")
+    print(f"table -> {out/'fle_uncertainty.npz'}   figure -> {out_png}")
 
 
 if __name__ == "__main__":
