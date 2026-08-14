@@ -7,6 +7,7 @@ os.environ["NCCL_P2P_DISABLE"] = "1"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import jax
+import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from datetime import date
 from jax import Array
@@ -126,6 +127,7 @@ class MetropolisAdjustedLangevinSampler:
         warm_start_sigma: tuple[float, float] = (0.1, 0.3),
         precondition: Literal["mode_hessian"] | None = None,
         precond_floor: float = 1e-3,
+        warmup: Literal["windowed", "legacy"] = "windowed",
         **kwargs,
     ):
         """Initializes the MetropolisAdjustedLangevinSampler transition kernel.
@@ -149,6 +151,11 @@ class MetropolisAdjustedLangevinSampler:
         self.parallel_chains = num_parallel_chains
         self.num_burnin = num_burnin
         self.warm_up_steps = warm_up_steps
+        # Warm-up scheme: "windowed" = continuous step adaptation toward TARGET_ACCEPT with
+        # expanding-window within-chain mass estimation, kernel FROZEN for the retained
+        # draws; "legacy" = the historical flow (unadapted warm-up, pooled-variance mass,
+        # adaptation through the retained draws) kept only for E-series reproduction.
+        self.warmup = warmup
         self.step_size = step_size
         self.seed = seed
         # Optional constrained-space starting point (e.g. an EOT/UOT Sinkhorn plan) to seed
@@ -327,12 +334,45 @@ class MetropolisAdjustedLangevinSampler:
         indices = jnp.arange(self.parallel_chains)
         return jax.vmap(_one_chain)(keys, indices)
 
-    def inference_loop_multiple_chains(self) -> Sequence[StackedMALAStates]:
-        self.init_key, new_key = jax.random.split(self.init_key)
-        sample_keys = jax.random.split(new_key, self.parallel_chains)
-        # * Sharding the keys across devices to run the chains in parallel.
-        sharded_keys = jax.device_put(sample_keys, SHARDING)
+    def _run_segment(self, num_steps, params, adapt_step, mass_diag):
+        """One vmapped inference segment; returns (carry, stacked) with fresh per-chain keys."""
+        self.init_key, sub_key = jax.random.split(self.init_key)
+        keys = jax.device_put(jax.random.split(sub_key, self.parallel_chains), SHARDING)
+        return jax.vmap(self.inference_loop, in_axes=(None, 0, 0, None, None))(
+            num_steps, params, keys, adapt_step, mass_diag)
 
+    @staticmethod
+    def _window_mass(stacked_states, window_len, prior_strength=5.0):
+        """Diagonal mass from ONE window: mean of within-chain variances, regularized.
+
+        Within-chain (var over steps, then mean over chains), never pooled: by the law of
+        total variance, pooling adds the between-chain dispersion of the means, which during
+        warm-up measures initialization spread and unconverged transient (historically: gauge
+        drift), not target variance. The estimate is shrunk toward its scalar mean with
+        weight n/(n + prior_strength) so a short window degrades toward an isotropic-but-
+        scaled mass instead of a noisy one (per-coordinate relative noise ~ sqrt(2/ESS_w)).
+        """
+        lat = stacked_states.stacked_latent_states           # (C, steps, 1, m)
+        v = jnp.mean(jnp.var(lat, axis=1), axis=0)           # (1, m)
+        w = window_len / (window_len + prior_strength)
+        return w * v + (1.0 - w) * jnp.mean(v)
+
+    def _warmup_windows(self):
+        """Split warm_up_steps into (init_buffer, [expanding windows], term_buffer)."""
+        W = self.warm_up_steps
+        buf = max(1, W // 6)
+        interior = max(1, W - 2 * buf)
+        wins, size = [], max(1, interior // 8)
+        while sum(wins) + size < interior:
+            wins.append(size)
+            size *= 2
+        if wins:
+            wins[-1] += interior - sum(wins)   # the LAST window absorbs the remainder: the
+        else:                                  # final mass must come from the longest window
+            wins = [interior]
+        return buf, wins, buf
+
+    def inference_loop_multiple_chains(self) -> Sequence[StackedMALAStates]:
         # * Initialize randomly the chains in parallel across the mesh. Ensure diversity of initial states.
         self.init_key, new_key = jax.random.split(self.init_key)
         new_keys = jax.random.split(new_key, self.parallel_chains)
@@ -340,39 +380,48 @@ class MetropolisAdjustedLangevinSampler:
         jax.debug.print(f"Initial states shape: {initial_states.shape}")
 
         step_sizes = self.step_size * jnp.ones((self.parallel_chains, 1))
-        params_to_shard = (initial_states, step_sizes)
-        sharded_params = jax.device_put(params_to_shard, SHARDING)
+        params = jax.device_put((initial_states, step_sizes), SHARDING)
+        ones_mass = jnp.ones((1, self.shape))
 
-        # First stage is a warm-up stage without step adaptation.
-        (warm_carry_states,
-         warm_stacked_states) = jax.vmap(self.inference_loop, in_axes=(None, 0, 0, None))(self.warm_up_steps,
-                                                                                          sharded_params,
-                                                                                          sharded_keys,
-                                                                                          True)
-        # * Compute the variance of each variable across all chains and all warm-up samples to estimate the diagonal
-        # * of the mass matrix. warm_stacked_states is a SINGLE vmapped StackedMALAStates whose fields
-        # * carry a leading chain axis -> (C, warm_steps, 1, m); average over chains and steps.
-        # TODO: confirm if the variance should be computed in the latent space versus the constrained space.
-        # The current implementation computes the variance in the latent space.
-        mass_diag = jnp.var(warm_stacked_states.stacked_latent_states, axis=(0, 1))
+        if self.warmup == "legacy":
+            # Historical flow, verbatim: warm-up with FROZEN step and identity mass; mass =
+            # variance POOLED over chains and steps; Robbins-Monro then adapts the step
+            # through burn-in AND retained draws. Kept only for E-series reproduction.
+            carry, warm_stacked = self._run_segment(self.warm_up_steps, params,
+                                                    False, ones_mass)
+            mass_diag = jnp.var(warm_stacked.stacked_latent_states, axis=(0, 1))
+            params = jax.device_put((carry.state, carry.step_size), SHARDING)
+            _, mix_stacked_states = self._run_segment(self.tot_num_samples, params,
+                                                      True, mass_diag)
+            return mix_stacked_states
 
-        # * Second stage is the main sampling stage with Robbins-Monro step size adaptation, using the estimated mass matrix.
-        # * Continue from the warm-up's final state and step size to ensure continuity between the two stages.
-        # * warm_carry_states is a SINGLE vmapped MALAState (fields batched over chains).
-        init_states = warm_carry_states.state             # (C, 1, m)
-        init_step_sizes = warm_carry_states.step_size     # (C, 1)
-        main_init_params = (init_states, init_step_sizes)
-        sharded_params = jax.device_put(main_init_params, SHARDING)
-        self.init_key, sub_key = jax.random.split(self.init_key)
-        sharded_keys = jax.random.split(sub_key, self.parallel_chains)
-        sharded_keys = jax.device_put(sharded_keys, SHARDING)
-        (_,
-         mix_stacked_states) = jax.vmap(self.inference_loop, in_axes=(None, 0, 0, None, None))(self.tot_num_samples,
-                                                                             sharded_params,
-                                                                             sharded_keys,
-                                                                             False,
-                                                                             mass_diag)
-        
+        # Windowed warm-up (Stan-shaped): the step adapts CONTINUOUSLY toward TARGET_ACCEPT
+        # under the current mass through all of warm-up; the mass updates at window closes
+        # from that window's within-chain variances; a terminal buffer re-settles the step
+        # under the frozen final mass; the retained stage then runs a FIXED kernel (no
+        # adaptation -- draws from a time-varying kernel are not MH-correct).
+        init_buf, windows, term_buf = self._warmup_windows()
+        mass_diag = ones_mass
+        carry, _ = self._run_segment(init_buf, params, True, mass_diag)
+        for win in windows:
+            params = jax.device_put((carry.state, carry.step_size), SHARDING)
+            carry, stacked = self._run_segment(win, params, True, mass_diag)
+            mass_diag = self._window_mass(stacked, win)
+        params = jax.device_put((carry.state, carry.step_size), SHARDING)
+        carry, _ = self._run_segment(term_buf, params, True, mass_diag)
+
+        steps = np.asarray(jax.device_get(carry.step_size)).reshape(-1)
+        mass_host = np.asarray(jax.device_get(mass_diag)).reshape(-1)
+        print(f"warmup[windowed] {init_buf}/{windows}/{term_buf}: "
+              f"step med {np.median(steps):.2e} [{steps.min():.2e}, {steps.max():.2e}] | "
+              f"mass cond {mass_host.max() / max(mass_host.min(), 1e-300):.1f}", flush=True)
+        if np.any(steps <= 1.02e-8) or np.any(steps >= 0.98):
+            print("warmup[windowed] WARNING: step clamp [1e-8, 1] is BINDING -- adaptation "
+                  "failed; retained-phase acceptance will not match TARGET_ACCEPT.", flush=True)
+
+        params = jax.device_put((carry.state, carry.step_size), SHARDING)
+        _, mix_stacked_states = self._run_segment(self.tot_num_samples, params,
+                                                  False, mass_diag)
         return mix_stacked_states
 
     def preconditioned_langevin_update(self, curr_pos, grad, step_size, mass_diag, key):
@@ -390,7 +439,7 @@ class MetropolisAdjustedLangevinSampler:
         num_steps: int,
         init_params: Tuple[Array, Array],
         init_keys: Array,
-        warm_up: bool = True,
+        adapt_step: bool = False,
         mass_diag: Array = None,
     ) -> Tuple[MALAState, StackedMALAStates]:
         """
@@ -400,9 +449,12 @@ class MetropolisAdjustedLangevinSampler:
             num_steps (int): the number of steps to run the inference loop.
             init_params (Tuple[Array, Array]): the initial parameters for the inference loop, including the initial state and step size.
             init_keys (Array): the initial random keys for the inference loop.
-            warm_up (bool, optional): whether to perform the warm-up phase. Defaults to True.
-            mass_diag (Array, optional): the diagonal of the mass matrix. Defaults to None.
-        
+            adapt_step (bool, optional): whether the Robbins-Monro step-size adaptation is
+                active in this segment (the counter -- hence the learning rate (1/ct)^0.6 --
+                restarts per segment, giving a hot re-adaptation after each mass update).
+            mass_diag (Array): the diagonal of the mass matrix, always supplied by the
+                caller (identity for the segments that precede the first estimate).
+
         """
 
         def langevin_step(current_state: MALAState, _):
@@ -414,7 +466,6 @@ class MetropolisAdjustedLangevinSampler:
             Returns:
                 Array: the next position.
             """
-            nonlocal mass_diag
             current_x = current_state.state
             current_ct = current_state.counter
             key = current_state.rng_keys
@@ -428,9 +479,7 @@ class MetropolisAdjustedLangevinSampler:
             current_grad = self.latent_score_function(current_x)
             # jax.debug.print("Current gradient: {x}", x=current_grad)
 
-            # Propose a new sample
-            mass_diag = mass_diag if not warm_up else jnp.ones_like(current_x)
-
+            # Propose a new sample (mass_diag is closed over; always caller-supplied)
             proposed_x, latent_log_prob_prop, latent_log_prob_curr, metrop_hastings_ratio = self.compute_metropolis_hastings_ratio(current_x, current_grad, step_size, mass_diag, sub_key)
 
             # MH Adjustment
@@ -449,10 +498,11 @@ class MetropolisAdjustedLangevinSampler:
             avg_mh_ratio = jnp.float32(avg_mh_ratio)
             # jax.debug.print("Current average MH ratio: {x}", x=avg_mh_ratio)
 
-            # Adapt the step size using a Robbins-Monroe process, after the warm-up phase is completed.
+            # Robbins-Monro step-size adaptation, active only in segments where the caller
+            # enabled it (warm-up under the windowed scheme; burn-in + retained under legacy).
             log_step_size = jnp.log(step_size)
             new_log_step_size = log_step_size + (1 / current_ct)**(0.6) * (avg_mh_ratio - TARGET_ACCEPT)
-            log_step_size = jnp.where(not warm_up, new_log_step_size, log_step_size)
+            log_step_size = jnp.where(adapt_step, new_log_step_size, log_step_size)
             step_size = jnp.exp(log_step_size)
 
             # * Clip the step size to avoid exploding values or very small values that would lead to numerical issues.
