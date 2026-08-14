@@ -1,10 +1,12 @@
-"""Particle-filtered HFPD-OT propagation over a day window -- first credible bands (PLACEHOLDER).
+"""Particle-filtered HFPD-OT propagation over a day window -- credible bands under the fixed kernel.
 
-Runs the module-5 marginal particle filter over consecutive day pairs with the current MALA ridge
-sampler injected. Every result this produces inherits the sampler's known partial mixing
-(R-hat_med ~2, ESS_med ~10^2 on the real target at the bridge config -- see the elimination log in
-``docs/paper_claims.md``), so the bands are **plumbing-validation placeholders, not results**: the
-full diagnostic triplet is stored next to every pair and must be reported with any figure.
+Runs the module-5 marginal particle filter over consecutive day pairs with the CERTIFIED fixed
+kernel injected: centered ridge ``gamma ||theta - theta_0||^2`` at the ratified ``gamma = 0.5``
+(``theta_0`` = warm start = the chart coordinates of pi^o), windowed warm-up, and per-pair
+``epsilon = (C_max - C_min) / 33`` (the ratified Gibbs sharpness) unless ``--eps`` overrides it.
+The full diagnostic triplet is stored next to every pair and gates it: a pair that fails the R1
+gates is not a result, whatever the bands look like. Fate membership ``W`` is the GMVAE posterior
+responsibilities ``q(c|z)`` (single-source doctrine), not curated annotations.
 
 Per pair, for every particle: the particle's marginal conditions its own hyperprior
 (``mu_0 :=`` particle weights, floored and renormalised; target prior uniform), plans are drawn,
@@ -20,6 +22,10 @@ Space level (per the locked design): random subsample of ``--budget`` cells per 
 Run from the repo root (newest run, defaults are a smoke; see --help):
     python scripts/run_particle_filter.py --days 12 12.5 13 --budget 20 --particles 2 \
         --samples 600 --burnin 200 --warmup 200
+Production (certified kernel, single-GPU):
+    CUDA_VISIBLE_DEVICES=1 python scripts/run_particle_filter.py \
+        --days 12 12.5 13 13.5 14 --budget 500 --particles 8 \
+        --samples 10000 --burnin 2000 --warmup 1200 --support positive_orthant
 """
 import argparse
 import json
@@ -42,6 +48,7 @@ import run_gmvae_train as R
 from gmvae.networks import GMVAENet
 from gmvae.embedder import VaDEEmbedder
 from gmvae_confusion import latest_run
+from wadd_artifacts import artifact_dir
 from wadd_dim_reduction import RandomSubsampler
 from wadd_ot import CellCloud, GaussianW2
 from wadd_lineage import transition_table
@@ -52,10 +59,15 @@ from langevin_sampler import MetropolisAdjustedLangevinSampler, HFPDOTHyperprior
 _MU_FLOOR = 1e-6      # conditioning floor: a particle weight of exactly 0 would put an infinite
                       # KL wall at that cell; the floor keeps the hyperprior proper and is far
                       # below any mass the bands could resolve at these draw counts
+_SHARPNESS = 33.0     # ratified Gibbs sharpness: eps = (C_max - C_min) / 33 per pair (E-series)
 
 
-def make_sampler(cost, II, JJ, lam, lam_I, eps, support, rank, cfg, seed):
-    """Close over the pair's fixed data; the returned callable is the injected ``PlanSampler``."""
+def make_sampler(cost, II, JJ, lam, lam_I, eps, support, rank, gamma, cfg, seed):
+    """Close over the pair's fixed data; the returned callable is the injected ``PlanSampler``.
+
+    ``gamma`` is the centered-ridge scale (the certified kernel); ``gamma = 0`` reproduces the
+    historical ridge-free runs and is a diagnostic setting only.
+    """
     def sample(mu_0, nu_0):
         mu = np.maximum(mu_0, _MU_FLOOR); mu = mu / mu.sum()
         prior = HFPDOTHyperprior(mu_0=mu, nu_0=nu_0, lambda_1=lam, lambda_2=lam,
@@ -67,13 +79,13 @@ def make_sampler(cost, II, JJ, lam, lam_I, eps, support, rank, cfg, seed):
             target_score_fn=prior.hyperprior_score_fun,
             shape=II * JJ, support=support, sampling_strategy="low_rank",
             II=II, JJ=JJ, rank=rank, cost=jnp.asarray(cost), epsilon=eps,
+            ridge=gamma, ridge_center="warm_start" if gamma > 0 else None,
             num_parallel_chains=cfg["chains"], num_samples=cfg["samples"],
             num_burnin=cfg["burnin"], warm_up_steps=cfg["warmup"], step_size=cfg["step"],
             seed=seed, initial_plan=prior.sinkhorn_init())
-        res = smp.sample(with_diagnostics=True)
-        plans = np.asarray(res.samples)
-        plans = plans.reshape(-1, plans.shape[-1])
+        res = smp.sample(with_diagnostics=True, max_pi_coords=2000)
         d = res.diagnostics
+        plans = smp.thinned_plans(res)      # thin in latent space, expand in chunks (no OOM)
         acc = np.asarray(res.stacked_mala_states.stacked_num_accepted_samples)
         acc_rate = float(np.mean(acc.reshape(len(acc), -1)[:, -1] /
                                  (cfg["samples"] + cfg["burnin"])))
@@ -87,17 +99,18 @@ def make_sampler(cost, II, JJ, lam, lam_I, eps, support, rank, cfg, seed):
 
 
 def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support, rank,
-         seed, sampler_cfg):
+         gamma, seed, sampler_cfg):
     run_dir = Path(run_dir)
     cfg = json.loads((run_dir / "diagnostics.json").read_text())
     ckpt = torch.load(run_dir / "model.pt", map_location="cpu")
     pops = ckpt["population_names"]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"run: {run_dir.name} | window: {days} | budget {budget} cells/day | "
-          f"P={particles} D={draws_kept} | lambda={lam} lam_I={lam_I} eps={eps} {support} | "
+          f"P={particles} D={draws_kept} | lambda={lam} lam_I={lam_I} "
+          f"eps={'range/33' if eps <= 0 else eps} {support} | gamma={gamma} (centered) | "
           f"sampler {sampler_cfg} | device {device}")
-    print("NOTE: placeholder bands -- sampler diagnostics are attached to every pair and gate "
-          "any use of these numbers.")
+    print("NOTE: per-pair diagnostics gate the bands -- a pair failing the R1 gates is not a "
+          "result, whatever its bands look like.")
 
     matrices, memberships, pops2 = R.assemble(days)
     assert pops2 == pops
@@ -108,15 +121,19 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
     sub = RandomSubsampler(seed=seed)
 
     staged = []
-    for exp, memb in zip(matrices, memberships):
+    for exp in matrices:
         post = embedder.embed(exp)
         idx = sub.indices(post, min(budget, len(post)))
-        staged.append({"day": exp.day, "post": post.select(idx),
-                       "W": memb.align_populations(pops2).matrix[idx]})
+        sel = post.select(idx)
+        # W = q(c|z) responsibilities (single-source doctrine): soft fate membership from the
+        # same posterior that drives every other uncertainty; defined at every day.
+        staged.append({"day": exp.day, "post": sel,
+                       "W": np.asarray(sel.prob_cat, dtype=np.float64)})
 
     ensemble = initial_ensemble(len(staged[0]["post"]))
     out = {"days": np.array(days), "populations": np.array(pops),
-           "lam": lam, "lam_I": lam_I, "eps": eps, "support": support}
+           "lam": lam, "lam_I": lam_I, "eps": eps, "support": support, "gamma": gamma,
+           "budget": budget, "seed": seed}
     # the tube: KL ball (mean = the propagated radius eta_prop, hyperprior moment condition) and
     # pairwise-TV diameter (Dobrushin-contraction readout), on fates and on cells
     spreads = [(days[0], 0.0, 0.0, 0.0, 0.0)]          # tube starts closed at the window root
@@ -126,8 +143,12 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
         II, JJ = len(a["post"]), len(b["post"])
         cost = GaussianW2()(CellCloud(a["post"].means, a["post"].stds),
                             CellCloud(b["post"].means, b["post"].stds))
-        sampler = make_sampler(cost, II, JJ, lam, lam_I, eps, support, rank,
-                               sampler_cfg, seed)
+        # eps <= 0 selects the ratified Gibbs sharpness per pair (the E-series regime).
+        eps_pair = eps if eps > 0 else float((np.asarray(cost).max() -
+                                              np.asarray(cost).min()) / _SHARPNESS)
+        sampler = make_sampler(cost, II, JJ, lam, lam_I, eps_pair, support, rank,
+                               gamma, sampler_cfg, seed)
+        out[f"eps_{a['day']:g}->{b['day']:g}"] = eps_pair
         table_of = lambda d, a=a, b=b, II=II, JJ=JJ: transition_table(
             np.asarray(d).reshape(II, JJ), a["W"], b["W"], pops, pops,
             a["day"], b["day"]).matrix
@@ -171,8 +192,13 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
     out["tube_tv_diam"] = np.array([s[2] for s in spreads])        # TV diameter, fate simplex
     out["tube_eta_cells"] = np.array([s[3] for s in spreads])
     out["tube_tv_cells"] = np.array([s[4] for s in spreads])
-    path = run_dir / (f"particle_filter_D{days[0]:g}-D{days[-1]:g}_P{particles}"
-                      f"_b{budget}_lam{lam:g}.npz")
+    adir = artifact_dir(run_dir, "particle_filter",
+                        config=dict(days=list(days), budget=budget, particles=particles,
+                                    draws_kept=draws_kept, lam=lam, lam_I=lam_I, eps=eps,
+                                    support=support, rank=rank, gamma=gamma, seed=seed,
+                                    sampler=sampler_cfg))
+    path = adir / (f"particle_filter_D{days[0]:g}-D{days[-1]:g}_P{particles}"
+                   f"_b{budget}_lam{lam:g}_g{gamma:g}.npz")
     np.savez(path, **out)
     print(f"\neta_prop (propagated KL-ball radius, fate simplex, nats): "
           f"{'  '.join(f'D{s[0]:g}:{s[1]:.4f}' for s in spreads)}")
@@ -190,17 +216,22 @@ if __name__ == "__main__":
     p.add_argument("--draws-kept", type=int, default=50)
     p.add_argument("--lam", type=float, default=10.0)
     p.add_argument("--lam-I", type=float, default=0.5)
-    p.add_argument("--eps", type=float, default=0.1)
+    p.add_argument("--eps", type=float, default=0.0,
+                   help="entropic regularisation; <= 0 selects the ratified per-pair "
+                        "(C_max - C_min)/33, a positive value is an absolute override")
     p.add_argument("--support", default="simplex", choices=["simplex", "positive_orthant"])
     p.add_argument("--rank", type=int, default=2)
+    p.add_argument("--gamma", type=float, default=0.5,
+                   help="centered-ridge scale (certified gamma* = 0.5 at budget 500); "
+                        "0 reproduces the historical ridge-free kernel")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--samples", type=int, default=600)
     p.add_argument("--burnin", type=int, default=200)
-    p.add_argument("--warmup", type=int, default=200)
+    p.add_argument("--warmup", type=int, default=1200)
     p.add_argument("--step", type=float, default=0.02)
     p.add_argument("--chains", type=int, default=4)
     a = p.parse_args()
     main(a.run_dir or latest_run(), a.days, a.budget, a.particles, a.draws_kept, a.lam,
-         a.lam_I, a.eps, a.support, a.rank, a.seed,
+         a.lam_I, a.eps, a.support, a.rank, a.gamma, a.seed,
          {"samples": a.samples, "burnin": a.burnin, "warmup": a.warmup, "step": a.step,
           "chains": a.chains})
