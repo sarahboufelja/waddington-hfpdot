@@ -52,8 +52,8 @@ from wadd_artifacts import artifact_dir
 from wadd_dim_reduction import RandomSubsampler
 from wadd_ot import CellCloud, GaussianW2
 from wadd_lineage import transition_table
-from wadd_propagation import (initial_ensemble, kl_ball, pairwise_tv, project_particles,
-                              propagate_pair, weighted_quantiles)
+from wadd_propagation import (MarginalParticle, initial_ensemble, kl_ball, pairwise_tv,
+                              project_particles, propagate_pair, weighted_quantiles)
 from langevin_sampler import MetropolisAdjustedLangevinSampler, HFPDOTHyperprior
 
 _MU_FLOOR = 1e-6      # conditioning floor: a particle weight of exactly 0 would put an infinite
@@ -85,7 +85,9 @@ def make_sampler(cost, II, JJ, lam, lam_I, eps, support, rank, gamma, cfg, seed)
             seed=seed, initial_plan=prior.sinkhorn_init())
         res = smp.sample(with_diagnostics=True, max_pi_coords=2000)
         d = res.diagnostics
-        plans = smp.thinned_plans(res)      # thin in latent space, expand in chunks (no OOM)
+        # per_chain=125 halves the peak transient (500 plans ~ 1 GB): on a shared host the
+        # OOM killer targets the largest single process, so peak RSS is survival-relevant.
+        plans = smp.thinned_plans(res, per_chain=125, chunk=50)
         acc = np.asarray(res.stacked_mala_states.stacked_num_accepted_samples)
         acc_rate = float(np.mean(acc.reshape(len(acc), -1)[:, -1] /
                                  (cfg["samples"] + cfg["burnin"])))
@@ -98,8 +100,48 @@ def make_sampler(cost, II, JJ, lam, lam_I, eps, support, rank, gamma, cfg, seed)
     return sample
 
 
+def _rebuild_ensemble(z, tag):
+    """The exact ensemble that left pair ``tag``: MarginalParticle is (weights, log_mass, parent)."""
+    E, M, par = z[f"ensemble_{tag}"], z[f"ensemble_mass_{tag}"], z[f"parents_{tag}"]
+    return [MarginalParticle(weights=E[i], log_mass=float(M[i]),
+                             parent=None if par[i] < 0 else int(par[i]))
+            for i in range(len(M))]
+
+
+def _find_resume(run_dir, config, tags):
+    """Partial record with the longest completed-pair prefix for this exact config.
+
+    Completed pairs are always a prefix (the loop checkpoints sequentially), so progress is
+    the prefix length. Config equality is checked against the manifest after a json round
+    trip; the `latest` symlink is skipped to avoid double-visiting its target.
+    """
+    config = json.loads(json.dumps(config, default=str))
+    best, best_n = None, 0
+    for man in sorted((Path(run_dir) / "particle_filter").glob("*/manifest.json")):
+        if man.parent.name == "latest":
+            continue
+        try:
+            stored = json.loads(man.read_text()).get("config", {})
+        except (OSError, json.JSONDecodeError):
+            continue
+        stored.pop("resumed_from", None)               # resumed records stay resumable
+        if stored != config:
+            continue
+        for npz in man.parent.glob("*.npz"):
+            try:
+                z = np.load(npz, allow_pickle=True)
+            except (OSError, ValueError):
+                continue
+            n = 0
+            while n < len(tags) and f"ensemble_{tags[n]}" in z.files:
+                n += 1
+            if n > best_n:
+                best, best_n = npz, n
+    return best, best_n
+
+
 def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support, rank,
-         gamma, seed, sampler_cfg):
+         gamma, seed, sampler_cfg, resume=False):
     run_dir = Path(run_dir)
     cfg = json.loads((run_dir / "diagnostics.json").read_text())
     ckpt = torch.load(run_dir / "model.pt", map_location="cpu")
@@ -111,6 +153,26 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
           f"sampler {sampler_cfg} | device {device}")
     print("NOTE: per-pair diagnostics gate the bands -- a pair failing the R1 gates is not a "
           "result, whatever its bands look like.")
+
+    # Artifact dir created at LAUNCH so the record can checkpoint incrementally: a run
+    # killed mid-window keeps every completed pair (the manifest timestamp marks launch).
+    config = dict(days=list(days), budget=budget, particles=particles,
+                  draws_kept=draws_kept, lam=lam, lam_I=lam_I, eps=eps,
+                  support=support, rank=rank, gamma=gamma, seed=seed,
+                  sampler=sampler_cfg)
+    tags = [f"{a:g}->{b:g}" for a, b in zip(days, days[1:])]
+    resume_src, done = (None, 0)
+    if resume:
+        resume_src, done = _find_resume(run_dir, config, tags)
+        print(f"resume: {resume_src} carries {done}/{len(tags)} pairs"
+              if resume_src else "resume: no matching partial record, starting fresh")
+        if done == len(tags):
+            print("window already complete; nothing to do")
+            return
+    adir = artifact_dir(run_dir, "particle_filter",
+                        config=dict(config, resumed_from=str(resume_src) if resume_src else ""))
+    path = adir / (f"particle_filter_D{days[0]:g}-D{days[-1]:g}_P{particles}"
+                   f"_b{budget}_lam{lam:g}_g{gamma:g}.npz")
 
     matrices, memberships, pops2 = R.assemble(days)
     assert pops2 == pops
@@ -129,6 +191,13 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
         # same posterior that drives every other uncertainty; defined at every day.
         staged.append({"day": exp.day, "post": sel,
                        "W": np.asarray(sel.prob_cat, dtype=np.float64)})
+    # Staging is the only consumer of the expression matrices, the embedder and the model;
+    # holding them for the whole window (~1 GB per day of matrices alone) is what pushed
+    # wide windows past host memory. The subsampled posteriors in `staged` are all the
+    # pair loop needs.
+    del matrices, memberships, embedder, model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     ensemble = initial_ensemble(len(staged[0]["post"]))
     out = {"days": np.array(days), "populations": np.array(pops),
@@ -137,9 +206,30 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
     # the tube: KL ball (mean = the propagated radius eta_prop, hyperprior moment condition) and
     # pairwise-TV diameter (Dobrushin-contraction readout), on fates and on cells
     spreads = [(days[0], 0.0, 0.0, 0.0, 0.0)]          # tube starts closed at the window root
+
+    if resume_src is not None and done:
+        z = np.load(resume_src, allow_pickle=True)
+        for key in z.files:                            # completed pairs carried forward wholesale
+            out[key] = z[key]
+        ensemble = _rebuild_ensemble(z, tags[done - 1])
+        # The tube statistics for completed pairs are recomputed from the stored ensembles
+        # (cheap; partial records checkpoint per-pair keys only, the tube arrays are written
+        # at completion).
+        for j in range(done):
+            ens_j = _rebuild_ensemble(z, tags[j])
+            b = staged[j + 1]
+            fates = project_particles(ens_j, b["W"])
+            e_f, _ = kl_ball(fates)
+            _, tv_f = pairwise_tv(fates)
+            e_c, _ = kl_ball(ens_j)
+            _, tv_c = pairwise_tv(ens_j)
+            spreads.append((b["day"], e_f, tv_f, e_c, tv_c))
+        np.savez(path, **out)                          # the new record is whole from step one
     print(f"\n{'pair':>14} {'draws':>6} {'rhat_med':>9} {'ess_med':>8} {'eBFMI':>7} {'acc':>5} "
           f"{'eta_prop':>9} {'TVdiam':>7} {'band width med':>15} {'max':>6}")
-    for a, b in zip(staged[:-1], staged[1:]):
+    for i, (a, b) in enumerate(zip(staged[:-1], staged[1:])):
+        if i < done:                                   # completed in the resumed record
+            continue
         II, JJ = len(a["post"]), len(b["post"])
         cost = GaussianW2()(CellCloud(a["post"].means, a["post"].stds),
                             CellCloud(b["post"].means, b["post"].stds))
@@ -186,19 +276,13 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
         out[f"pool_parents_{tag}"] = np.array([p.parent for p in rec.pool])
         out[f"W_fates_{b['day']:g}"] = b["W"]
         out[f"nu0_fates_{tag}"] = np.full(JJ, 1.0 / JJ) @ b["W"]
+        np.savez(path, **out)               # incremental checkpoint: pair-level durability
 
     out["tube_day"] = np.array([s[0] for s in spreads])
     out["tube_eta_prop"] = np.array([s[1] for s in spreads])       # KL ball mean, fate simplex
     out["tube_tv_diam"] = np.array([s[2] for s in spreads])        # TV diameter, fate simplex
     out["tube_eta_cells"] = np.array([s[3] for s in spreads])
     out["tube_tv_cells"] = np.array([s[4] for s in spreads])
-    adir = artifact_dir(run_dir, "particle_filter",
-                        config=dict(days=list(days), budget=budget, particles=particles,
-                                    draws_kept=draws_kept, lam=lam, lam_I=lam_I, eps=eps,
-                                    support=support, rank=rank, gamma=gamma, seed=seed,
-                                    sampler=sampler_cfg))
-    path = adir / (f"particle_filter_D{days[0]:g}-D{days[-1]:g}_P{particles}"
-                   f"_b{budget}_lam{lam:g}_g{gamma:g}.npz")
     np.savez(path, **out)
     print(f"\neta_prop (propagated KL-ball radius, fate simplex, nats): "
           f"{'  '.join(f'D{s[0]:g}:{s[1]:.4f}' for s in spreads)}")
@@ -225,6 +309,9 @@ if __name__ == "__main__":
                    help="centered-ridge scale (certified gamma* = 0.5 at budget 500); "
                         "0 reproduces the historical ridge-free kernel")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--resume", action="store_true",
+                   help="continue from the config-matching partial record with the most "
+                        "completed pairs (per-pair checkpoints make kills resumable)")
     p.add_argument("--samples", type=int, default=600)
     p.add_argument("--burnin", type=int, default=200)
     p.add_argument("--warmup", type=int, default=1200)
@@ -234,4 +321,4 @@ if __name__ == "__main__":
     main(a.run_dir or latest_run(), a.days, a.budget, a.particles, a.draws_kept, a.lam,
          a.lam_I, a.eps, a.support, a.rank, a.gamma, a.seed,
          {"samples": a.samples, "burnin": a.burnin, "warmup": a.warmup, "step": a.step,
-          "chains": a.chains})
+          "chains": a.chains}, resume=a.resume)

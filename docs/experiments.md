@@ -757,3 +757,27 @@ certified fixed kernel.
 
 **Reproduce:** `python scripts/experiments/e13_gold_anchor.py --budget 8 --exp gold` then
 `python scripts/experiments/e13_gold_report.py --exp gold`.
+
+## Production band campaign — full-timecourse certified plan-uncertainty records
+
+**Completed 2026-08-15.** Particle-filtered credible bands under the certified fixed kernel
+(centered gamma* = 0.5, windowed W = 1200, q(c|z) membership, per-pair eps = C-range/33)
+over the full GSE122662 timecourse: four windows (D0-D6, D6-D12, D12-D14, D14-D18),
+38 day-pairs, budget 500 cells/day, P = 8 particles, 4 x 10k draws per particle run.
+
+**Gates: 0/38 pairs fail.** R-hat_med <= 1.019 on every pair (median 1.015), ESS_med >= 1017,
+acceptance ~0.57. The campaign ran under severe host-memory contention (repeated OOM kills);
+records were produced via per-pair checkpointing + resume (completed pairs are always a
+prefix; resumed records rebuild the marginal ensemble exactly from the stored
+weights/log-mass/parent triples). Best record per window sits in
+assets/gmvae_runs/<run>/particle_filter/<stamp>/ with launch manifests.
+
+**Tube readout (within-window propagated KL-ball radius, fate simplex):** near zero through
+D0-D8 (<= 0.003 nats), rising through the decision window (D9-D13: 0.003 -> 0.010) and
+largest late (D15-D18: 0.015-0.023). Tubes reset at window roots by construction —
+cross-window chaining would compound entropic blur (C1), so within-window propagation is
+the principled scope.
+
+**Reproduce:** `python scripts/run_particle_filter.py --days <window> --budget 500
+--particles 8 --samples 10000 --burnin 2000 --warmup 1200 --support positive_orthant
+[--resume]`.
