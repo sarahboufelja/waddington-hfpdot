@@ -7,9 +7,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from wadd_propagation import (MarginalParticle, PairRecord, fps_trim, initial_ensemble,
-                              kl_ball, pairwise_tv, project_particles, propagate_pair,
-                              push_forward_marginal, weighted_quantiles, _logsumexp, _sym_kl)
+from wadd_propagation import (MarginalParticle, PairRecord, ancestor_pr, ancestor_overlap,
+                              dominant_destination_hist, extras_slices, fps_trim,
+                              identity_readouts, initial_ensemble, kl_ball, pairwise_tv,
+                              project_particles, propagate_pair, push_forward_marginal,
+                              w_series_extras, weighted_quantiles, _logsumexp, _sym_kl)
 
 
 def _particle(w, log_mass=0.0, parent=None):
@@ -23,10 +25,11 @@ class TestPushForward:
         nu = push_forward_marginal(plan.reshape(-1), 2, 2)
         np.testing.assert_allclose(nu, [0.5, 0.5])
 
-    def test_unbalanced_plan_normalised(self):
+    def test_unbalanced_plan_carries_mass(self):
         plan = np.array([[2.0, 0.0], [0.0, 6.0]])          # total mass 8 (growth)
         nu = push_forward_marginal(plan.reshape(-1), 2, 2)
-        np.testing.assert_allclose(nu, [0.25, 0.75])
+        np.testing.assert_allclose(nu, [2.0, 6.0])         # masses, not a distribution:
+        assert nu.sum() == 8.0                             # total mass IS the growth signal
 
     def test_zero_mass_rejected(self):
         with pytest.raises(ValueError, match="non-positive total mass"):
@@ -101,6 +104,27 @@ class TestPropagatePair:
         np.testing.assert_allclose(np.exp(total), 1.0, atol=1e-12)
         assert len(rec.diagnostics) == 2 and rec.diagnostics[0]["mock"]
 
+    def test_growth_aligns_with_draws(self):
+        II = JJ = 4
+        rec = propagate_pair(initial_ensemble(II), self._mock_sampler(6), np.full(JJ, 1 / JJ),
+                             II, JJ, budget=2, table_of_plan=lambda d: d.reshape(II, JJ))
+        assert rec.growth.shape == (6, II)
+        # growth = transported source mass = row sums of each draw, in draw order
+        np.testing.assert_allclose(rec.growth.sum(axis=1),
+                                   [t.sum() for t in rec.tables], rtol=1e-12)
+
+    def test_extra_channel_aligns_and_defaults_none(self):
+        II = JJ = 4
+        rec0 = propagate_pair(initial_ensemble(II), self._mock_sampler(4), np.full(JJ, 1 / JJ),
+                              II, JJ, budget=2, table_of_plan=lambda d: d.reshape(II, JJ))
+        assert rec0.extras is None
+        rec = propagate_pair(initial_ensemble(II), self._mock_sampler(6), np.full(JJ, 1 / JJ),
+                             II, JJ, budget=2, table_of_plan=lambda d: d.reshape(II, JJ),
+                             extra_of_plan=lambda d: np.asarray(d).sum())
+        assert rec.extras.shape == (6,)
+        # same draws, same order as the table channel
+        np.testing.assert_allclose(rec.extras, [t.sum() for t in rec.tables], rtol=1e-12)
+
     def test_futures_thinning(self):
         II = JJ = 4
         rec = propagate_pair(initial_ensemble(II), self._mock_sampler(50), np.full(JJ, 1 / JJ),
@@ -114,6 +138,85 @@ class TestPropagatePair:
         with pytest.raises(ValueError, match="expected"):
             propagate_pair(initial_ensemble(II), bad, np.full(JJ, 1 / JJ), II, JJ,
                            budget=2, table_of_plan=lambda d: d)
+
+
+class TestAncestorPr:
+    def test_uniform_mass_counts_all_ancestors(self):
+        II, JJ = 6, 5
+        pi = np.full((II, JJ), 1.0 / (II * JJ))
+        np.testing.assert_allclose(ancestor_pr(pi, np.ones((JJ, 1))), [II])
+
+    def test_single_ancestor_reads_one(self):
+        pi = np.zeros((5, 4)); pi[2] = 1.0
+        np.testing.assert_allclose(ancestor_pr(pi, np.ones((4, 1))), [1.0])
+
+    def test_scale_invariant_and_bounded(self):
+        rng = np.random.default_rng(0)
+        pi = rng.uniform(size=(6, 5))
+        W = rng.dirichlet(np.ones(3), size=5)          # (JJ, K) soft memberships
+        pr = ancestor_pr(pi, W)
+        np.testing.assert_allclose(ancestor_pr(3.7 * pi, W), pr, rtol=1e-12)
+        assert np.all(pr >= 1.0) and np.all(pr <= 6.0)
+
+    def test_empty_fate_reads_zero(self):
+        pi = np.ones((4, 3))
+        W = np.zeros((3, 2)); W[:, 0] = 1.0            # second fate receives nothing
+        pr = ancestor_pr(pi, W)
+        assert pr[0] == 4.0 and pr[1] == 0.0
+
+
+class TestChannelFunctionals:
+    def test_dominant_destination_mass_weighted(self):
+        # cell 0 (mass 3) dominant to fate 1; cell 1 (mass 1) dominant to fate 0
+        A = np.array([[1.0, 2.0], [0.75, 0.25]])
+        np.testing.assert_allclose(dominant_destination_hist(A), [0.25, 0.75])
+
+    def test_overlap_diagonal_disjoint_and_empty(self):
+        A = np.array([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]])   # disjoint profiles, fate 2 empty
+        O = ancestor_overlap(A)
+        np.testing.assert_allclose(np.diag(O), [1.0, 1.0, 0.0])
+        assert O[0, 1] == 0.0 and np.allclose(O, O.T)
+
+    def test_overlap_identical_profiles(self):
+        a = np.array([0.2, 0.5, 0.3])
+        O = ancestor_overlap(np.stack([a, 4.0 * a], axis=1))
+        np.testing.assert_allclose(O, 1.0)                 # scale-free: same shape -> BC = 1
+
+    def test_identity_readouts_single_resample_zero_var(self):
+        rng = np.random.default_rng(0)
+        pi = rng.uniform(size=(5, 4))
+        W = rng.dirichlet(np.ones(3), size=(1, 4))         # M = 1
+        mean, var = identity_readouts(pi, rng.dirichlet(np.ones(3), size=(1, 5)), W)
+        np.testing.assert_allclose(var, 0.0, atol=1e-15)
+
+    def test_identity_readouts_match_loop(self):
+        rng = np.random.default_rng(1)
+        pi = rng.uniform(size=(6, 5))
+        Ws_a = rng.dirichlet(np.ones(3), size=(4, 6))
+        Ws_b = rng.dirichlet(np.ones(3), size=(4, 5))
+        mean, var = identity_readouts(pi, Ws_a, Ws_b)
+        T = np.stack([Ws_a[m].T @ pi @ Ws_b[m] for m in range(4)])
+        np.testing.assert_allclose(mean, T.mean(axis=0), rtol=1e-12)
+        np.testing.assert_allclose(var, T.var(axis=0), rtol=1e-10, atol=1e-15)
+
+    def test_w_series_extras_layout_roundtrip(self):
+        rng = np.random.default_rng(2)
+        K = 3
+        pi = rng.uniform(size=(6, 5))
+        W_b = rng.dirichlet(np.ones(K), size=5)
+        Ws_a = rng.dirichlet(np.ones(K), size=(4, 6))
+        Ws_b = rng.dirichlet(np.ones(K), size=(4, 5))
+        v = w_series_extras(pi, W_b, Ws_a, Ws_b)
+        sl = extras_slices(K)
+        assert len(v) == 2 * K + 3 * K * K
+        A = pi @ W_b
+        np.testing.assert_allclose(v[sl["ancestor_pr"]], ancestor_pr(pi, W_b))
+        np.testing.assert_allclose(v[sl["dom_dest"]], dominant_destination_hist(A))
+        np.testing.assert_allclose(v[sl["ancestor_overlap"]].reshape(K, K),
+                                   ancestor_overlap(A))
+        m, va = identity_readouts(pi, Ws_a, Ws_b)
+        np.testing.assert_allclose(v[sl["table_identity_mean"]].reshape(K, K), m)
+        np.testing.assert_allclose(v[sl["table_identity_var"]].reshape(K, K), va)
 
 
 class TestWeightedQuantiles:
@@ -188,11 +291,13 @@ class TestPairwiseTv:
 
 
 class TestProjectParticles:
-    def test_projection_and_renormalisation(self):
+    def test_projection_aggregates_mass(self):
         W = np.array([[1.0, 0.0], [0.5, 0.5], [0.0, 0.0]])   # third atom unlabeled
         p = _particle([0.5, 0.25, 0.25], log_mass=np.log(0.4), parent=3)
         out = project_particles([p], W)[0]
-        np.testing.assert_allclose(out.weights, [0.625 / 0.75, 0.125 / 0.75])
+        # Aggregation, no renormalisation: the unlabeled atom's mass is dropped by its
+        # zero row (mass-preserving exactly when rows sum to 1, e.g. q(c|z)).
+        np.testing.assert_allclose(out.weights, [0.625, 0.125])
         assert out.log_mass == p.log_mass and out.parent == 3
 
     def test_contraction_under_lumping(self):
