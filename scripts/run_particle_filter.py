@@ -52,26 +52,59 @@ from wadd_artifacts import artifact_dir
 from wadd_dim_reduction import RandomSubsampler
 from wadd_ot import CellCloud, GaussianW2
 from wadd_lineage import transition_table
-from wadd_propagation import (MarginalParticle, initial_ensemble, kl_ball, pairwise_tv,
-                              project_particles, propagate_pair, weighted_quantiles)
+from wadd_propagation import (MarginalParticle, extras_slices, initial_ensemble, kl_ball,
+                              pairwise_tv, project_particles, propagate_pair,
+                              w_series_extras, weighted_quantiles)
+from wadd_schema import validate_record
 from langevin_sampler import MetropolisAdjustedLangevinSampler, HFPDOTHyperprior
 
 _MU_FLOOR = 1e-6      # conditioning floor: a particle weight of exactly 0 would put an infinite
                       # KL wall at that cell; the floor keeps the hyperprior proper and is far
                       # below any mass the bands could resolve at these draw counts
 _SHARPNESS = 33.0     # ratified Gibbs sharpness: eps = (C_max - C_min) / 33 per pair (E-series)
+_IDENTITY_RESAMPLES = 16   # M: Rao-Blackwellised z-resamples for the E14 identity channel
 
 
-def make_sampler(cost, II, JJ, lam, lam_I, eps, support, rank, gamma, cfg, seed):
+def _resampled_responsibilities(model, sel, day, seed, device):
+    """(M, n, K) Rao-Blackwellised responsibility resamples for the identity channel.
+
+    z is redrawn from each cell's own encoder posterior; gamma = q(c|z) stays the exact
+    analytic conditional (c is never sampled). The mean-z W remains the deterministic
+    membership for tables and projections (the embedder contract); these resamples feed
+    ONLY the E14 identity-variance read-out. Deterministic per (seed, day).
+    """
+    rng = np.random.default_rng([seed, int(round(day * 100))])
+    mu = np.asarray(sel.means)
+    sd = np.sqrt(np.asarray(sel.variances))
+    z = mu[None] + sd[None] * rng.standard_normal((_IDENTITY_RESAMPLES, *mu.shape))
+    with torch.no_grad():
+        lg = model.inference_net.responsibilities(
+            torch.as_tensor(z.reshape(-1, mu.shape[1]), dtype=torch.float32, device=device))
+    return np.exp(lg.cpu().numpy()).reshape(
+        _IDENTITY_RESAMPLES, len(mu), -1).astype(np.float64)
+
+
+def make_sampler(cost, II, JJ, lam, lam_I, lam_pi, eps, support, rank, gamma, cfg, seed):
     """Close over the pair's fixed data; the returned callable is the injected ``PlanSampler``.
 
     ``gamma`` is the centered-ridge scale (the certified kernel); ``gamma = 0`` reproduces the
     historical ridge-free runs and is a diagnostic setting only.
     """
     def sample(mu_0, nu_0):
-        mu = np.maximum(mu_0, _MU_FLOOR); mu = mu / mu.sum()
-        prior = HFPDOTHyperprior(mu_0=mu, nu_0=nu_0, lambda_1=lam, lambda_2=lam,
-                                 lambda_I_1=lam_I, lambda_I_2=lam_I,
+        # Intrinsic growth (orthant only): the particle's marginal enters as MASSES -- the
+        # plan's per-cell and total mass may deviate from the marginals (lambda-soft), so
+        # growth and apoptosis are carried by the posterior itself. The target prior keeps
+        # its direction but is rescaled to the source mass: mass-neutral, no exogenous
+        # growth assumption. On the simplex, plans are normalised by construction, so the
+        # historical renormalisation is retained there.
+        mu = np.maximum(mu_0, _MU_FLOOR)
+        nu = np.asarray(nu_0, dtype=float)
+        if support == "simplex":
+            mu = mu / mu.sum()
+        else:
+            nu = nu * (mu.sum() / nu.sum())
+        prior = HFPDOTHyperprior(mu_0=mu, nu_0=nu, lambda_1=lam, lambda_2=lam,
+                                 lambda_I_1=lam_I, lambda_I_2=lam_I, lambda_pi=lam_pi,
                                  cost_fn=np.asarray(cost).reshape(-1), epsilon=eps,
                                  support=support)
         smp = MetropolisAdjustedLangevinSampler(
@@ -140,24 +173,28 @@ def _find_resume(run_dir, config, tags):
     return best, best_n
 
 
-def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support, rank,
-         gamma, seed, sampler_cfg, resume=False):
+def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, lam_pi, eps, support,
+         rank, gamma, seed, sampler_cfg, resume=False):
     run_dir = Path(run_dir)
     cfg = json.loads((run_dir / "diagnostics.json").read_text())
     ckpt = torch.load(run_dir / "model.pt", map_location="cpu")
     pops = ckpt["population_names"]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"run: {run_dir.name} | window: {days} | budget {budget} cells/day | "
-          f"P={particles} D={draws_kept} | lambda={lam} lam_I={lam_I} "
+          f"P={particles} D={draws_kept} | lambda={lam} lam_I={lam_I} lam_pi={lam_pi:g} "
           f"eps={'range/33' if eps <= 0 else eps} {support} | gamma={gamma} (centered) | "
           f"sampler {sampler_cfg} | device {device}")
     print("NOTE: per-pair diagnostics gate the bands -- a pair failing the R1 gates is not a "
           "result, whatever its bands look like.")
+    if lam_pi != 1:
+        print(f"DIAGNOSTIC KERNEL: lam_pi={lam_pi:g} ablates the ideal-design term "
+              "gKL(pi || pi_I) -- this is NOT the HFPD-OT hyperprior (Def 2) and the "
+              "kernel certificate does not apply; records carry an _lpi suffix.")
 
     # Artifact dir created at LAUNCH so the record can checkpoint incrementally: a run
     # killed mid-window keeps every completed pair (the manifest timestamp marks launch).
     config = dict(days=list(days), budget=budget, particles=particles,
-                  draws_kept=draws_kept, lam=lam, lam_I=lam_I, eps=eps,
+                  draws_kept=draws_kept, lam=lam, lam_I=lam_I, lam_pi=lam_pi, eps=eps,
                   support=support, rank=rank, gamma=gamma, seed=seed,
                   sampler=sampler_cfg)
     tags = [f"{a:g}->{b:g}" for a, b in zip(days, days[1:])]
@@ -172,7 +209,8 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
     adir = artifact_dir(run_dir, "particle_filter",
                         config=dict(config, resumed_from=str(resume_src) if resume_src else ""))
     path = adir / (f"particle_filter_D{days[0]:g}-D{days[-1]:g}_P{particles}"
-                   f"_b{budget}_lam{lam:g}_g{gamma:g}.npz")
+                   f"_b{budget}_lam{lam:g}_g{gamma:g}"
+                   + ("" if lam_pi == 1 else f"_lpi{lam_pi:g}") + ".npz")
 
     matrices, memberships, pops2 = R.assemble(days)
     assert pops2 == pops
@@ -190,7 +228,8 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
         # W = q(c|z) responsibilities (single-source doctrine): soft fate membership from the
         # same posterior that drives every other uncertainty; defined at every day.
         staged.append({"day": exp.day, "post": sel,
-                       "W": np.asarray(sel.prob_cat, dtype=np.float64)})
+                       "W": np.asarray(sel.prob_cat, dtype=np.float64),
+                       "W_rs": _resampled_responsibilities(model, sel, exp.day, seed, device)})
     # Staging is the only consumer of the expression matrices, the embedder and the model;
     # holding them for the whole window (~1 GB per day of matrices alone) is what pushed
     # wide windows past host memory. The subsampled posteriors in `staged` are all the
@@ -201,8 +240,8 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
 
     ensemble = initial_ensemble(len(staged[0]["post"]))
     out = {"days": np.array(days), "populations": np.array(pops),
-           "lam": lam, "lam_I": lam_I, "eps": eps, "support": support, "gamma": gamma,
-           "budget": budget, "seed": seed}
+           "lam": lam, "lam_I": lam_I, "lam_pi": lam_pi, "eps": eps, "support": support,
+           "gamma": gamma, "budget": budget, "seed": seed}
     # the tube: KL ball (mean = the propagated radius eta_prop, hyperprior moment condition) and
     # pairwise-TV diameter (Dobrushin-contraction readout), on fates and on cells
     spreads = [(days[0], 0.0, 0.0, 0.0, 0.0)]          # tube starts closed at the window root
@@ -224,6 +263,7 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
             e_c, _ = kl_ball(ens_j)
             _, tv_c = pairwise_tv(ens_j)
             spreads.append((b["day"], e_f, tv_f, e_c, tv_c))
+        validate_record(out, tags[:done])
         np.savez(path, **out)                          # the new record is whole from step one
     print(f"\n{'pair':>14} {'draws':>6} {'rhat_med':>9} {'ess_med':>8} {'eBFMI':>7} {'acc':>5} "
           f"{'eta_prop':>9} {'TVdiam':>7} {'band width med':>15} {'max':>6}")
@@ -236,14 +276,17 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
         # eps <= 0 selects the ratified Gibbs sharpness per pair (the E-series regime).
         eps_pair = eps if eps > 0 else float((np.asarray(cost).max() -
                                               np.asarray(cost).min()) / _SHARPNESS)
-        sampler = make_sampler(cost, II, JJ, lam, lam_I, eps_pair, support, rank,
+        sampler = make_sampler(cost, II, JJ, lam, lam_I, lam_pi, eps_pair, support, rank,
                                gamma, sampler_cfg, seed)
         out[f"eps_{a['day']:g}->{b['day']:g}"] = eps_pair
         table_of = lambda d, a=a, b=b, II=II, JJ=JJ: transition_table(
             np.asarray(d).reshape(II, JJ), a["W"], b["W"], pops, pops,
             a["day"], b["day"]).matrix
+        extra_of = lambda d, a=a, b=b, II=II, JJ=JJ: w_series_extras(
+            np.asarray(d).reshape(II, JJ), b["W"], a["W_rs"], b["W_rs"])
         rec = propagate_pair(ensemble, sampler, np.full(JJ, 1.0 / JJ), II, JJ,
                              budget=particles, table_of_plan=table_of,
+                             extra_of_plan=extra_of,
                              day_from=a["day"], day_to=b["day"],
                              max_futures_per_particle=draws_kept)
         ensemble = rec.futures
@@ -264,6 +307,16 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
               f"{tv_diam:>7.3f} {np.nanmedian(width[live]):>15.4f} {np.nanmax(width[live]):>6.3f}")
         out[f"tables_q_{tag}"] = qs
         out[f"table_log_mass_{tag}"] = rec.table_log_mass
+        # Raw per-draw fate tables + the W-series/identity channel: the W-series
+        # robustness semantics evaluate each conclusion JOINTLY within a draw, which
+        # stored quantiles cannot support; the identity blocks carry the E14
+        # law-of-total-variance split. ~1.7 MB per pair; layout in wadd_schema.
+        out[f"tables_{tag}"] = rec.tables
+        K = len(pops)
+        for name, sl in extras_slices(K).items():
+            block = rec.extras[:, sl]
+            out[f"{name}_{tag}"] = (block.reshape(-1, K, K)
+                                    if sl.stop - sl.start == K * K else block)
         out[f"diag_{tag}"] = json.dumps(rec.diagnostics)
         out[f"ensemble_{tag}"] = np.stack([p.weights for p in ensemble])
         out[f"ensemble_mass_{tag}"] = np.array([p.log_mass for p in ensemble])
@@ -276,6 +329,26 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
         out[f"pool_parents_{tag}"] = np.array([p.parent for p in rec.pool])
         out[f"W_fates_{b['day']:g}"] = b["W"]
         out[f"nu0_fates_{tag}"] = np.full(JJ, 1.0 / JJ) @ b["W"]
+        # Growth as posterior random variables (intrinsic; draw-aligned with the tables):
+        # per-cell growth factor g_i = transported mass / input mass, its fate-level
+        # aggregate through q(c|z), and the per-step total-mass ratio.
+        mu_of = np.stack([np.asarray(rec.source[q.parent].weights) for q in rec.pool])
+        g_cell = rec.growth / np.maximum(mu_of, _MU_FLOOR)
+        g_fate = (rec.growth @ a["W"]) / np.maximum(mu_of @ a["W"], _MU_FLOOR)
+        qs3 = [0.025, 0.5, 0.975]
+        ratio = rec.growth.sum(axis=1) / np.maximum(mu_of.sum(axis=1), _MU_FLOOR)
+        out[f"growth_q_{tag}"] = weighted_quantiles(g_cell, rec.table_log_mass, qs3)
+        out[f"growth_fate_q_{tag}"] = weighted_quantiles(g_fate, rec.table_log_mass, qs3)
+        # Relative growth is the reportable metric: the low-rank chart biases the GLOBAL
+        # mass scale (the E13 volume-term family; uniform across fates by measurement),
+        # so dividing each draw by its own total-mass ratio quotients the chart bias out
+        # and leaves the per-fate structure. Absolute masses stay as diagnostics.
+        out[f"growth_rel_q_{tag}"] = weighted_quantiles(
+            g_cell / ratio[:, None], rec.table_log_mass, qs3)
+        out[f"growth_fate_rel_q_{tag}"] = weighted_quantiles(
+            g_fate / ratio[:, None], rec.table_log_mass, qs3)
+        out[f"mass_ratio_q_{tag}"] = weighted_quantiles(ratio, rec.table_log_mass, qs3)
+        validate_record(out, tags[:i + 1])  # schema gate: fail at write time, not read time
         np.savez(path, **out)               # incremental checkpoint: pair-level durability
 
     out["tube_day"] = np.array([s[0] for s in spreads])
@@ -283,6 +356,7 @@ def main(run_dir, days, budget, particles, draws_kept, lam, lam_I, eps, support,
     out["tube_tv_diam"] = np.array([s[2] for s in spreads])        # TV diameter, fate simplex
     out["tube_eta_cells"] = np.array([s[3] for s in spreads])
     out["tube_tv_cells"] = np.array([s[4] for s in spreads])
+    validate_record(out, tags, complete=True)
     np.savez(path, **out)
     print(f"\neta_prop (propagated KL-ball radius, fate simplex, nats): "
           f"{'  '.join(f'D{s[0]:g}:{s[1]:.4f}' for s in spreads)}")
@@ -300,6 +374,9 @@ if __name__ == "__main__":
     p.add_argument("--draws-kept", type=int, default=50)
     p.add_argument("--lam", type=float, default=10.0)
     p.add_argument("--lam-I", type=float, default=0.5)
+    p.add_argument("--lam-pi", type=float, default=1.0,
+                   help="weight of the ideal-design term gKL(pi || pi_I); 1 is the model, "
+                        "smaller values attribute the term's mass pull (diagnostic only)")
     p.add_argument("--eps", type=float, default=0.0,
                    help="entropic regularisation; <= 0 selects the ratified per-pair "
                         "(C_max - C_min)/33, a positive value is an absolute override")
@@ -319,6 +396,6 @@ if __name__ == "__main__":
     p.add_argument("--chains", type=int, default=4)
     a = p.parse_args()
     main(a.run_dir or latest_run(), a.days, a.budget, a.particles, a.draws_kept, a.lam,
-         a.lam_I, a.eps, a.support, a.rank, a.gamma, a.seed,
+         a.lam_I, a.lam_pi, a.eps, a.support, a.rank, a.gamma, a.seed,
          {"samples": a.samples, "burnin": a.burnin, "warmup": a.warmup, "step": a.step,
           "chains": a.chains}, resume=a.resume)
