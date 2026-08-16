@@ -40,7 +40,6 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 
 from gmvae_confusion import latest_run
 from wadd_data_ingest import read_fle_coords
-from wadd_propagation import MarginalParticle, kl_ball, pairwise_tv, project_particles
 from fle_plan_bands import (_COARSE_ORDER, _INK, _MUTED, draw_identity_base,
                             ensemble_cell_spread, load_identity_base, rebuild_support)
 
@@ -77,27 +76,29 @@ def _caption(state):
 def _states(rec, run_dir, budget, seed, coords):
     days = rec["days"].tolist()
     support = rebuild_support(run_dir, days, budget, seed, coords)
+    # The tube (eta_prop, TV diameter) is READ from the record: the filter computed it
+    # through q(c|z), where no cell's mass can be dropped. Recomputing it here through
+    # the drawing membership duplicated the derivation and lost unannotated cells.
+    eta = np.asarray(rec["tube_eta_prop"])
+    tv = np.asarray(rec["tube_tv_diam"])
     m0 = len(support[days[0]]["xy"])
     states = [{"day": days[0], "W": np.full((1, m0), 1.0 / m0), "mass": np.array([1.0]),
                "colour": [_INK], "xy": support[days[0]]["xy"],
-               "fate": support[days[0]]["fate"], "eta": 0.0, "tv": 0.0,
+               "fate": support[days[0]]["fate"], "eta": float(eta[0]), "tv": float(tv[0]),
                "caption": "Start: one map, no disagreement yet."}]
     colours = None
-    for a, b in zip(days[:-1], days[1:]):
+    for i, (a, b) in enumerate(zip(days[:-1], days[1:])):
         tag = f"{a:g}->{b:g}"
         W, lm = rec[f"ensemble_{tag}"], rec[f"ensemble_mass_{tag}"]
         parents = rec[f"parents_{tag}"]
         if colours is None:
-            colours = [_LINEAGE[i % len(_LINEAGE)] for i in range(len(W))]
+            colours = [_LINEAGE[j % len(_LINEAGE)] for j in range(len(W))]
         else:
             colours = [prev_colours[p] if p >= 0 else _INK for p in parents]
         prev_colours = colours
-        parts = [MarginalParticle(weights=w, log_mass=float(m), parent=None)
-                 for w, m in zip(W, lm)]
-        fates = project_particles(parts, support[b]["W"])   # fate-simplex tube: same currency
         state = {"day": b, "W": W, "mass": np.exp(lm - np.max(lm)), "colour": list(colours),
                  "xy": support[b]["xy"], "fate": support[b]["fate"],
-                 "eta": kl_ball(fates)[0], "tv": float(pairwise_tv(fates)[1])}
+                 "eta": float(eta[i + 1]), "tv": float(tv[i + 1])}
         state["caption"] = _caption(state)
         states.append(state)
     return states

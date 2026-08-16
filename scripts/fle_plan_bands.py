@@ -72,7 +72,9 @@ def coarse_of(name):
 
 
 def load_identity_base(run_dir):
-    """Full-landscape base from the L1 overlay record: coords + coarse MAP fate per cell."""
+    """Full-landscape base from the L1 overlay record: coords + coarse MAP fate per cell
+    (argmax of q(c|z) at the mean z). Territory TINT only -- no statistic reads it; every
+    uncertainty field on these overlays is a mass-weighted ensemble statistic."""
     d = np.load(latest_artifact(run_dir, "fle_uncertainty") / "fle_uncertainty.npz",
                 allow_pickle=True)
     pops = [str(p) for p in d["populations"]]
@@ -98,13 +100,16 @@ def draw_identity_base(ax, x, y, coarse_idx, label_territories=True):
 
 
 def rebuild_support(run_dir, days, budget, seed, coords):
-    """Deterministically re-derive each window day's support cells: coords + coarse MAP fate."""
+    """Deterministically re-derive each window day's support cells: coords + coarse MAP fate.
+
+    Drawing data only (dot positions and territory colours). Statistics come from the
+    record; in particular the tube is stored in-record, computed through q(c|z)."""
     run_dir = Path(run_dir)
     cfg = json.loads((run_dir / "diagnostics.json").read_text())
     ckpt = torch.load(run_dir / "model.pt", map_location="cpu")
     pops = ckpt["population_names"]
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    matrices, memberships, pops2 = R.assemble(days)
+    matrices, _, pops2 = R.assemble(days)
     assert pops2 == pops
     model = GMVAENet(x_dim=matrices[0].n_genes, num_clusters=len(pops),
                      latent_dim=cfg["latent_dim"], hidden_dim=cfg["hidden_dim"])
@@ -113,14 +118,13 @@ def rebuild_support(run_dir, days, budget, seed, coords):
     sub = RandomSubsampler(seed=seed)
     coarse_pop = np.array([_COARSE_ORDER.index(coarse_of(p)) for p in pops])
     support = {}
-    for exp, memb in zip(matrices, memberships):
+    for exp in matrices:
         post = embedder.embed(exp)
         idx = sub.indices(post, min(budget, len(post)))
         ids = [post.cells.ids[i] for i in idx]
         xy = np.array([coords.get(cid, (np.nan, np.nan)) for cid in ids])
         fate = coarse_pop[np.argmax(np.asarray(post.prob_cat)[idx], axis=1)]
-        support[exp.day] = {"xy": xy, "fate": fate,
-                            "W": memb.align_populations(pops2).matrix[idx]}
+        support[exp.day] = {"xy": xy, "fate": fate}
     return support
 
 
