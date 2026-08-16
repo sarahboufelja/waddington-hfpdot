@@ -620,7 +620,8 @@ class MetropolisAdjustedLangevinSampler:
 class HFPDOTHyperprior:
     def __init__(
         self, mu_0, nu_0, lambda_1, lambda_2, lambda_I_1, lambda_I_2, cost_fn, epsilon,
-        support: Literal["simplex", "positive_orthant"] = "simplex"
+        support: Literal["simplex", "positive_orthant"] = "simplex",
+        lambda_pi: float = 1.0
     ):
         self.mu_0 = jnp.asarray(mu_0)
         self.nu_0 = jnp.asarray(nu_0)
@@ -630,6 +631,10 @@ class HFPDOTHyperprior:
         self.lambda_2 = lambda_2
         self.lambda_I_1 = lambda_I_1
         self.lambda_I_2 = lambda_I_2
+        # Weight of the ideal-design term gKL(pi || pi_I). 1.0 is the model; on the
+        # positive orthant pi_I is the unnormalised Gibbs kernel, so the term also
+        # anchors total mass -- values below 1 are attribution diagnostics for that pull.
+        self.lambda_pi = lambda_pi
         self.support = support
         self.II = len(self.mu_0)
         self.JJ = len(self.nu_0)
@@ -685,7 +690,7 @@ class HFPDOTHyperprior:
         kl2 = - (self.lambda_2 + self.lambda_I_2) * HFPDOTHyperprior.shifted_kl_div(
             nu, self.nu_0
         )
-        kl3 = - HFPDOTHyperprior.shifted_kl_div(pi, self.pi_I)
+        kl3 = - self.lambda_pi * HFPDOTHyperprior.shifted_kl_div(pi, self.pi_I)
 
         return kl1 + kl2 + kl3
     
@@ -710,7 +715,7 @@ class HFPDOTHyperprior:
         kl2 = - (self.lambda_2 + self.lambda_I_2) * HFPDOTHyperprior.generalized_kl_div(
             nu, self.nu_0
         )
-        kl3 = - HFPDOTHyperprior.generalized_kl_div(pi, self.pi_I)
+        kl3 = - self.lambda_pi * HFPDOTHyperprior.generalized_kl_div(pi, self.pi_I)
 
         return kl1 + kl2 + kl3
     
@@ -804,7 +809,7 @@ class HFPDOTHyperprior:
 
         grad_mu = -(self.lambda_1 + self.lambda_I_1) * jnp.log((mu + epsilon) / (self.mu_0 + epsilon))
         grad_nu = -(self.lambda_2 + self.lambda_I_2) * jnp.log((nu + epsilon) / (self.nu_0 + epsilon))
-        grad_pi = -jnp.log((pi_mat + epsilon) / (pi_I_mat + epsilon))
+        grad_pi = -self.lambda_pi * jnp.log((pi_mat + epsilon) / (pi_I_mat + epsilon))
 
         grad = grad_pi + jnp.expand_dims(grad_mu, axis=1) + jnp.expand_dims(grad_nu, axis=0)
         return grad.reshape(pi.shape)

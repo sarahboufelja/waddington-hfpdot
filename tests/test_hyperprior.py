@@ -28,7 +28,7 @@ from langevin_sampler import HFPDOTHyperprior, MetropolisAdjustedLangevinSampler
 from supports import Simplex, PositiveOrthant
 
 
-def _make_prior(II=3, JJ=4, seed=0):
+def _make_prior(II=3, JJ=4, seed=0, **kw):
     k1, k2, k3 = jax.random.split(jax.random.key(seed), 3)
     mu_0 = jax.random.uniform(k1, (II,), minval=0.1, maxval=1.0)
     mu_0 = mu_0 / mu_0.sum()
@@ -38,7 +38,7 @@ def _make_prior(II=3, JJ=4, seed=0):
     prior = HFPDOTHyperprior(
         mu_0=mu_0, nu_0=nu_0,
         lambda_1=0.5, lambda_2=0.3, lambda_I_1=0.01, lambda_I_2=0.02,
-        cost_fn=cost, epsilon=0.1,
+        cost_fn=cost, epsilon=0.1, **kw,
     )
     return prior, II, JJ
 
@@ -63,6 +63,22 @@ def test_score_exact_balanced_on_simplex():
 def test_score_exact_unbalanced_on_orthant():
     prior, II, JJ = _make_prior()
     _assert_score_matches_grad(prior, II, JJ, PositiveOrthant(), prior.unbalanced_hyperprior_log_prob_fun)
+
+
+def test_lambda_pi_scales_only_the_ideal_term():
+    """lambda_pi = 1 is the paper's hyperprior (Def 2) exactly; lambda_pi = 0 removes
+    precisely gKL(pi || pi_I) from the log-prob, and the score stays exact at any weight."""
+    full, II, JJ = _make_prior()
+    off, _, _ = _make_prior(lambda_pi=0.0)
+    pi = jnp.abs(jax.random.normal(jax.random.key(5), (1, II * JJ))) + 0.1
+    gap = (off.unbalanced_hyperprior_log_prob_fun(pi)
+           - full.unbalanced_hyperprior_log_prob_fun(pi))
+    assert jnp.allclose(gap, HFPDOTHyperprior.generalized_kl_div(pi, full.pi_I))
+    half, _, _ = _make_prior(lambda_pi=0.5)
+    _assert_score_matches_grad(half, II, JJ, PositiveOrthant(),
+                               half.unbalanced_hyperprior_log_prob_fun)
+    _assert_score_matches_grad(half, II, JJ, Simplex(),
+                               half.balanced_hyperprior_log_prob_fun)
 
 
 def test_score_exact_nonsquare():
