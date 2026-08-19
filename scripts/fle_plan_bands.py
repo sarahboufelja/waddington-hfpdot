@@ -48,6 +48,7 @@ from gmvae_confusion import latest_run
 from wadd_artifacts import latest_artifact
 from wadd_dim_reduction import RandomSubsampler
 from wadd_data_ingest import read_fle_coords
+from wadd_figstyle import FULL_W, apply as _style
 
 _INK, _MUTED = "#1e293b", "#64748b"
 
@@ -155,9 +156,14 @@ def main(record_path, run_dir, budget, seed, coords_path):
     support = rebuild_support(run_dir, days, budget, seed, coords)
 
     pairs = list(zip(days[:-1], days[1:]))
-    fig, axes = plt.subplots(1, len(pairs), figsize=(4.1 * len(pairs) + 1.2, 4.8),
+    _style()
+    ncols = 2 if len(pairs) <= 6 else 4
+    nrows = (len(pairs) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(FULL_W, 3.3 * nrows),
                              sharex=True, sharey=True)
-    axes = np.atleast_1d(axes)
+    axes = np.atleast_1d(axes).ravel()
+    for spare in axes[len(pairs):]:
+        spare.set_visible(False)
     last = None
     print(f"\nper-fate concern (mass share of the day's ensemble mean, and its spread):")
     for ax, (a, b) in zip(axes, pairs):
@@ -168,15 +174,13 @@ def main(record_path, run_dir, budget, seed, coords_path):
         xy, fate = sup["xy"], sup["fate"]
         ok = np.isfinite(xy[:, 0])
         draw_identity_base(ax, bx, by, bfate, label_territories=(ax is axes[0]))
-        last = ax.scatter(xy[ok, 0], xy[ok, 1], s=34.0 + 260.0 * mean[ok] / max(mean.max(), 1e-12),
+        last = ax.scatter(xy[ok, 0], xy[ok, 1], s=22.0 + 170.0 * mean[ok] / max(mean.max(), 1e-12),
                           c=spread[ok], cmap="YlOrRd", vmin=0.0, vmax=2.0, lw=0.7,
                           edgecolors="white", zorder=3)
         diag = json.loads(str(rec[f"diag_{tag}"]))
         dmed = float(np.median([g["rhat_med"] for g in diag]))
-        ax.set_title(f"D{b:g}   (draws from D{a:g})", color=_INK, fontsize=10,
-                     fontweight="bold", loc="left")
-        ax.text(0.02, 0.02, f"R-hat_med {dmed:.2f}", transform=ax.transAxes, color=_MUTED,
-                fontsize=8)
+        ax.set_title(f"D{b:g}   (draws from D{a:g})", color=_INK)
+        ax.text(0.02, 0.02, f"R-hat_med {dmed:.2f}", transform=ax.transAxes, color=_MUTED)
         rows = []
         for gi, g in enumerate(_COARSE_ORDER):
             sel = fate == gi
@@ -185,7 +189,7 @@ def main(record_path, run_dir, budget, seed, coords_path):
                             f"{np.average(spread[sel], weights=np.maximum(mean[sel], 1e-12)):.2f}")
         print(f"  D{b:g}: " + " | ".join(rows))
     cb = fig.colorbar(last, ax=axes, shrink=0.8, pad=0.01)
-    cb.set_label("descendant-mass spread  sd/mean  (ensemble)", color=_MUTED, fontsize=9)
+    cb.set_label("arriving-mass spread  sd/mean  (ensemble)", color=_MUTED)
     cb.ax.tick_params(colors=_MUTED, labelsize=8)
     cb.outline.set_visible(False)
     gam = rec.get("gamma", None)
@@ -194,9 +198,9 @@ def main(record_path, run_dir, budget, seed, coords_path):
             "UNCERTIFIED KERNEL (pre-ratification record; gates stamped per panel)")
     fig.suptitle("Plan-uncertainty bands over the fate territories  —  " + prov +
                  "; size = mean descendant mass", color=_INK,
-                 fontsize=11.5, fontweight="bold", x=0.01, ha="left")
+                 fontsize=10, fontweight="bold", x=0.01, ha="left")
     out = Path(record_path).with_suffix("").as_posix() + "_fle.png"
-    fig.savefig(out, dpi=170, bbox_inches="tight")
+    fig.savefig(out)
     plt.close(fig)
     print(f"figure -> {out}")
 

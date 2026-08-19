@@ -36,6 +36,7 @@ from diag_blur_composition import row_spread
 from fle_plan_bands import _INK, _MUTED
 from gmvae_confusion import latest_run
 from wadd_artifacts import artifact_dir
+from wadd_figstyle import FULL_W, apply as _style
 
 QS = [0.025, 0.5, 0.975]
 
@@ -105,11 +106,16 @@ def main(run_dir, budget, n_chains, seed):
                            E2E._lineage_complete)
         lineage[eps] = (np.load(child / "transition_tables.npz", allow_pickle=True)
                        if child else None)
-    fig, axes = plt.subplots(1, len(E2E.WINDOWS), figsize=(4.0 * len(E2E.WINDOWS), 3.9),
-                             sharey=True)
+    _style()
+    ncols = 2
+    nrows = (len(E2E.WINDOWS) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(FULL_W, 2.9 * nrows), sharey=True)
+    axes = np.atleast_1d(axes).ravel()
+    for ax in axes[len(E2E.WINDOWS):]:
+        ax.set_visible(False)
     result = {}
     rng = np.random.default_rng(seed)
-    for ax, days in zip(np.atleast_1d(axes), E2E.WINDOWS):
+    for ax, days in zip(axes, E2E.WINDOWS):
         name = f"D{days[0]:g}-D{days[-1]:g}"
         cfg = dict(E2E.PF_DEFAULTS, days=list(days), budget=budget)
         child = E2E._adopt(run_dir, "particle_filter", cfg, E2E._pf_complete(days))
@@ -130,10 +136,8 @@ def main(run_dir, budget, n_chains, seed):
                 ax.plot(n, det, color="#b45309", lw=1.4, ls=ls,
                         label=f"deterministic eps={eps:g}")
         ax.set_yscale("log")
-        ax.set_xlabel("composed steps from window root")
-        ax.set_title(name + (f"   delta_eff {d_cri[1]:.3f} [{d_cri[0]:.3f}, {d_cri[2]:.3f}]"
-                             if d_cri else ""), fontsize=9, color=_INK)
-        ax.spines[["top", "right"]].set_visible(False)
+        ax.set_title(name + (f"   $\\delta_{{\\mathrm{{eff}}}}$ {d_cri[1]:.3f} [{d_cri[0]:.3f}, {d_cri[2]:.3f}]"
+                             if d_cri else ""), color=_INK)
         result[name] = dict(horizons=n.tolist(), spread_cri=np.stack([lo, med, hi]).tolist(),
                             delta_eff_cri=d_cri,
                             deterministic={str(e): (deterministic_curve(lineage[e], days).tolist()
@@ -141,15 +145,17 @@ def main(run_dir, budget, n_chains, seed):
                                                     else None) for e in (0.1, 0.2)})
         print(f"{name}: spread {med[0]:.3f} -> {med[-1]:.3f} over {len(n)} steps | "
               f"delta_eff {d_cri}")
-    np.atleast_1d(axes)[0].set_ylabel("source-fate row spread (max pairwise TV)")
-    np.atleast_1d(axes)[0].legend(frameon=False, fontsize=7.5)
-    fig.suptitle("Dobrushin contraction of composed sampled tables, with credible bands "
-                 "(within-window horizons; deterministic CK ladder anchors longer spans)",
-                 fontsize=10, color=_MUTED)
+    for ax in axes[-ncols:]:
+        ax.set_xlabel("composed steps from window root")
+    for i in range(0, len(E2E.WINDOWS), ncols):
+        axes[i].set_ylabel("source-fate row spread\n(max pairwise TV)")
+    axes[0].legend()
+    fig.suptitle("Dobrushin contraction of composed sampled tables, with credible bands",
+                 fontsize=10, color=_MUTED, x=0.01, ha="left")
     out_dir = artifact_dir(run_dir, "dobrushin_bands",
                            config=dict(budget=budget, chains=n_chains, seed=seed))
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
-    fig.savefig(out_dir / "dobrushin_bands.png", dpi=160)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(out_dir / "dobrushin_bands.png")
     plt.close(fig)
     (out_dir / "dobrushin_bands.json").write_text(json.dumps(result, indent=2))
     print(f"dobrushin bands -> {out_dir}")

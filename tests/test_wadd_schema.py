@@ -7,7 +7,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from wadd_schema import PAIR_KEYS, RUN_KEYS, TUBE_KEYS, validate_record
+from wadd_schema import (D2_KEYS, PAIR_KEYS, RUN_KEYS, TUBE_KEYS, validate_d2_record,
+                         validate_record)
 
 
 def _record(tags=("1->2",), K=2, D=6, P=3, JJ=4, II=4, complete=False):
@@ -92,3 +93,61 @@ def test_declared_keys_cover_helper():
         assert key in out
     for tpl in PAIR_KEYS:
         assert tpl.format(tag="1->2") in out
+
+
+def _d2_record(K=2, D=6):
+    return {"days": np.array([8.0, 9.0]),
+            "populations": np.array([f"f{i}" for i in range(K)]),
+            "lam": 10.0, "lam_I": 0.5, "lam_pi": 1.0, "eps": 0.0,
+            "support": "positive_orthant", "gamma": 0.5, "budget": 4, "seed": 0,
+            "d2_days": np.array([8.0, 8.5, 9.0]), "d2_alpha": 0.5, "d2_eps": 0.2,
+            "d2_comp": np.full((D, K), 1.0 / K), "d2_total_mass": np.ones(D),
+            "d2_real": np.full(K, 1.0 / K), "d2_real_n": 4,
+            "d2_comp_t1": np.full(K, 1.0 / K), "d2_comp_t3": np.full(K, 1.0 / K),
+            "d2_diag": "[]"}
+
+
+def test_d2_conforming_record_passes():
+    validate_d2_record(_d2_record())
+
+
+def test_d2_missing_key_is_named():
+    out = _d2_record()
+    del out["d2_real_n"]
+    with pytest.raises(ValueError, match="d2_real_n"):
+        validate_d2_record(out)
+
+
+def test_d2_rowsum_violation_is_caught():
+    out = _d2_record()
+    out["d2_comp"] = np.full((6, 2), 0.7)
+    with pytest.raises(ValueError, match="summing to 1"):
+        validate_d2_record(out)
+
+
+def test_d2_alpha_inconsistency_is_caught():
+    out = _d2_record()
+    out["d2_alpha"] = 0.25
+    with pytest.raises(ValueError, match="d2_alpha"):
+        validate_d2_record(out)
+
+
+def test_d2_pair_triplet_mismatch_is_caught():
+    out = _d2_record()
+    out["days"] = np.array([8.0, 9.5])
+    with pytest.raises(ValueError, match="d2_days"):
+        validate_d2_record(out)
+
+
+def test_d2_draw_misalignment_is_caught():
+    out = _d2_record()
+    out["d2_total_mass"] = np.ones(5)                       # D = 6 elsewhere
+    with pytest.raises(ValueError, match="leading dim"):
+        validate_d2_record(out)
+
+
+def test_d2_declared_keys_cover_helper():
+    """The D2 fake record builder and the schema must not drift apart."""
+    out = _d2_record()
+    for key in list(RUN_KEYS) + list(D2_KEYS):
+        assert key in out

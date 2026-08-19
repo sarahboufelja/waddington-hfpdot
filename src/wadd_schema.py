@@ -1,13 +1,15 @@
-"""Declared schema of the particle-filter record -- the single source of truth.
+"""Declared schemas of the pipeline records -- the single source of truth.
 
-Every key the filter writes is declared here with its shape contract and its consumers.
+Every key a producer writes is declared here with its shape contract and its consumers.
 The process rule this module encodes: a new consumer need is a schema change FIRST, then
-a producer change -- never an ad-hoc key bolted onto the pair loop. ``validate_record``
-gates every ``np.savez`` in the filter, so a record that would silently starve a consumer
-fails at write time, not at read time.
+a producer change -- never an ad-hoc key bolted onto a loop. ``validate_record`` gates
+every ``np.savez`` in the particle filter and ``validate_d2_record`` every D2 coverage
+record, so a record that would silently starve a consumer fails at write time, not at
+read time.
 
 Shape symbols: P particles, D draws kept per pair, K fates, II/JJ source/target support
-sizes, Q quantile levels (2.5/50/97.5%), M identity resamples, n_day staged cells per day.
+sizes, Q quantile levels (2.5/50/97.5%), M identity resamples, n_day staged cells per
+day, N real cells behind an observed composition.
 """
 from __future__ import annotations
 
@@ -66,6 +68,23 @@ TUBE_KEYS = {
     "tube_tv_diam":   "(n_days,); pairwise-TV diameter, fate simplex",
     "tube_eta_cells": "(n_days,); KL-ball radius, cell resolution",
     "tube_tv_cells":  "(n_days,); pairwise-TV diameter, cell resolution",
+}
+
+#: D2 held-out coverage record, one per triplet (t1, t2, t3); the runner samples the
+#: DIRECT (t1, t3) pair (never composed -- no CK gate) and stores per-draw mid-point
+#: compositions; multinomial noise is applied by the reader, never stored
+D2_KEYS = {
+    "d2_days":       "(3,); the triplet (t1, t2, t3) in real time stamps",
+    "d2_alpha":      "scalar; interpolation weight (t2 - t1) / (t3 - t1)",
+    "d2_eps":        "scalar; realised per-pair epsilon (C-range / 33 when eps <= 0)",
+    "d2_comp":       "(D, K); per-draw mid-point compositions p-hat, rows sum to 1 "
+                     "[coverage reader: predictive via Multinomial(N, p-hat)]",
+    "d2_total_mass": "(D,); raw plan mass per draw before normalisation [scale diagnostic]",
+    "d2_real":       "(K,); observed soft composition m-bar at t2 [coverage reader]",
+    "d2_real_n":     "scalar int; real cells behind m-bar -- the multinomial N",
+    "d2_comp_t1":    "(K,); observed composition at t1 [persistence baseline]",
+    "d2_comp_t3":    "(K,); observed composition at t3 [linear-mixture baseline]",
+    "d2_diag":       "json str; sampler gates (R-hat, ESS, eBFMI, acc) for the (t1, t3) pair",
 }
 
 #: per-draw families whose leading dimension must agree within a pair
@@ -131,3 +150,46 @@ def validate_record(out: dict, tags, complete: bool = False) -> None:
 
     if problems:
         raise ValueError("record schema violations:\n  " + "\n  ".join(problems))
+
+
+def validate_d2_record(out: dict) -> None:
+    """Raise ValueError naming every D2 schema violation; silent on a conforming record.
+
+    Missing keys are reported first (and alone); shape and consistency checks run once
+    the record is key-complete. ``days`` must equal the sampled (t1, t3) pair of
+    ``d2_days`` and ``d2_alpha`` must be the mid-point weight implied by the stamps.
+    """
+    problems = [f"missing key '{k}'" for k in list(RUN_KEYS) + list(D2_KEYS) if k not in out]
+    if problems:
+        raise ValueError("D2 record schema violations:\n  " + "\n  ".join(problems))
+
+    K = len(np.asarray(out["populations"]))
+    days3 = np.asarray(out["d2_days"], dtype=float)
+    if days3.shape != (3,) or not (days3[0] < days3[1] < days3[2]):
+        problems.append(f"'d2_days' must be 3 increasing stamps, got {days3}")
+    else:
+        if not np.allclose(np.asarray(out["days"], dtype=float), days3[[0, 2]]):
+            problems.append(f"'days' {np.asarray(out['days'])} != sampled pair (t1, t3) "
+                            "of 'd2_days'")
+        alpha = float(out["d2_alpha"])
+        if not np.isclose(alpha, (days3[1] - days3[0]) / (days3[2] - days3[0])):
+            problems.append(f"'d2_alpha' {alpha:g} inconsistent with 'd2_days'")
+    comp = np.asarray(out["d2_comp"], dtype=float)
+    if comp.ndim != 2 or comp.shape[1] != K:
+        problems.append(f"'d2_comp' shape {comp.shape} != (D, K)")
+    else:
+        if len(np.asarray(out["d2_total_mass"])) != len(comp):
+            problems.append("'d2_total_mass' leading dim != draws of 'd2_comp'")
+        if comp.min() < -1e-9 or not np.allclose(comp.sum(axis=1), 1.0, atol=1e-6):
+            problems.append("'d2_comp' rows must be compositions summing to 1")
+    for k in ("d2_real", "d2_comp_t1", "d2_comp_t3"):
+        v = np.asarray(out[k], dtype=float)
+        if v.shape != (K,):
+            problems.append(f"'{k}' shape {v.shape} != (K,)")
+        elif v.min() < -1e-9 or not np.isclose(v.sum(), 1.0, atol=1e-6):
+            problems.append(f"'{k}' must be a composition summing to 1")
+    if int(out["d2_real_n"]) <= 0:
+        problems.append("'d2_real_n' must be a positive cell count")
+
+    if problems:
+        raise ValueError("D2 record schema violations:\n  " + "\n  ".join(problems))
